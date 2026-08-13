@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.models.graph.cells import MLPCell
+from rsl_rl.models.graph.cells import MLPCell, TemporalAttentionCell
 from rsl_rl.modules import EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
@@ -162,8 +162,10 @@ class ModelGraph(nn.Module):
         for name in self.obs_groups:
             if name not in obs:
                 raise ValueError(f"Graph input observation group '{name}' is missing.")
-            if obs[name].ndim != 2:
-                raise ValueError(f"MLP graph input '{name}' must be rank 2, got shape {tuple(obs[name].shape)}.")
+            if obs[name].ndim not in (2, 3):
+                raise ValueError(
+                    f"Graph input '{name}' must be rank 2 or 3, got shape {tuple(obs[name].shape)}."
+                )
             dims[name] = obs[name].shape[-1]
         return dims
 
@@ -211,4 +213,6 @@ class ModelGraph(nn.Module):
     def _resolve_cell(class_name: str):
         if class_name == "MLPCell":
             return MLPCell
+        if class_name == "TemporalAttentionCell":
+            return TemporalAttentionCell
         return resolve_callable(class_name)
