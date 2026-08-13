@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.models.graph.cells import MLPCell, TemporalAttentionCell
+from rsl_rl.models.graph.cells import InterleavedCausalAttentionCell, MLPCell, TemporalAttentionCell
 from rsl_rl.modules import EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
@@ -69,6 +69,7 @@ class ModelGraph(nn.Module):
             raise ValueError("ModelGraph currently supports distributions with a scalar input dimension only.")
 
         self.nodes = nn.ModuleDict()
+        self._node_input_modes: dict[str, str] = {}
         endpoint_dims = {f"inputs.{name}": dim for name, dim in self._input_dims.items()}
         for node_name in self._execution_order:
             sources = self._incoming[node_name]
@@ -76,6 +77,10 @@ class ModelGraph(nn.Module):
             node_cfg = self._node_cfgs[node_name]
             cell_cfg = node_cfg.get("cell", node_cfg).copy()
             cell_class_name = cell_cfg.pop("class_name")
+            input_mode = cell_cfg.pop("input_mode", "concat")
+            if input_mode not in {"concat", "list"}:
+                raise ValueError(f"Unsupported input_mode '{input_mode}' for node '{node_name}'.")
+            self._node_input_modes[node_name] = input_mode
             node_output_dim = cell_cfg.pop("output_dim", None)
             endpoint = f"nodes.{node_name}.output"
             if node_output_dim is None:
@@ -83,7 +88,8 @@ class ModelGraph(nn.Module):
                     raise ValueError(f"Node '{node_name}' must define cell.output_dim because it is not graph output.")
                 node_output_dim = graph_output_dim
             cell_class = self._resolve_cell(cell_class_name)
-            self.nodes[node_name] = cell_class(input_dim=input_dim, output_dim=node_output_dim, **cell_cfg)
+            cell_input_dim = [endpoint_dims[source] for source in sources] if input_mode == "list" else input_dim
+            self.nodes[node_name] = cell_class(input_dim=cell_input_dim, output_dim=node_output_dim, **cell_cfg)
             endpoint_dims[endpoint] = node_output_dim
 
         if self.output_endpoint not in endpoint_dims:
@@ -107,11 +113,15 @@ class ModelGraph(nn.Module):
     ) -> torch.Tensor:
         obs = unpad_trajectories(obs, masks) if masks is not None else obs
         tensors = {
-            f"inputs.{name}": self.input_normalizers[name](obs[name]) for name in self._input_dims
+            f"inputs.{name}": self.input_normalizers[name](self._input_tensor(obs[name], name))
+            for name in self._input_dims
         }
         for node_name in self._execution_order:
             parts = [tensors[source] for source in self._incoming[node_name]]
-            node_input = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+            if self._node_input_modes[node_name] == "list":
+                node_input = parts
+            else:
+                node_input = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
             tensors[f"nodes.{node_name}.output"] = self.nodes[node_name](node_input)
         graph_output = tensors[self.output_endpoint]
         if self.distribution is not None:
@@ -124,7 +134,7 @@ class ModelGraph(nn.Module):
     def update_normalization(self, obs: TensorDict) -> None:
         if self.obs_normalization:
             for name in self._input_dims:
-                self.input_normalizers[name].update(obs[name])  # type: ignore
+                self.input_normalizers[name].update(self._input_tensor(obs[name], name))  # type: ignore
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         pass
@@ -162,12 +172,28 @@ class ModelGraph(nn.Module):
         for name in self.obs_groups:
             if name not in obs:
                 raise ValueError(f"Graph input observation group '{name}' is missing.")
-            if obs[name].ndim not in (2, 3):
+            input_tensor = self._input_tensor(obs[name], name)
+            if input_tensor.ndim not in (2, 3):
                 raise ValueError(
-                    f"Graph input '{name}' must be rank 2 or 3, got shape {tuple(obs[name].shape)}."
+                    f"Graph input '{name}' must be rank 2 or 3, got shape {tuple(input_tensor.shape)}."
                 )
-            dims[name] = obs[name].shape[-1]
+            dims[name] = input_tensor.shape[-1]
         return dims
+
+    @staticmethod
+    def _input_tensor(value, name: str) -> torch.Tensor:
+        """Unwrap a non-concatenated observation group containing one term."""
+        if isinstance(value, torch.Tensor):
+            return value
+        if hasattr(value, "keys"):
+            keys = list(value.keys())
+            if len(keys) == 1:
+                tensor = value[keys[0]]
+                if isinstance(tensor, torch.Tensor):
+                    return tensor
+        raise ValueError(
+            f"Graph input observation group '{name}' must be a tensor or contain exactly one tensor term."
+        )
 
     def _compile_graph(self) -> tuple[dict[str, list[str]], list[str]]:
         incoming: dict[str, list[str]] = defaultdict(list)
@@ -215,4 +241,6 @@ class ModelGraph(nn.Module):
             return MLPCell
         if class_name == "TemporalAttentionCell":
             return TemporalAttentionCell
+        if class_name == "InterleavedCausalAttentionCell":
+            return InterleavedCausalAttentionCell
         return resolve_callable(class_name)

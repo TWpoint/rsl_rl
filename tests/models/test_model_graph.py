@@ -131,3 +131,51 @@ def test_temporal_attention_and_command_branches():
     assert output.shape == (5, 3)
     assert graph.nodes["decoder"].input_dim == 48
     assert graph.nodes["temporal_encoder"].readout_token.grad is not None
+
+
+def test_interleaved_causal_attention_with_non_concatenated_action_group():
+    obs = TensorDict(
+        {
+            "policy": torch.randn(5, 5, 12),
+            "last_action": TensorDict({"actions": torch.randn(5, 4, 6)}, batch_size=[5]),
+            "command": torch.randn(5, 7),
+        },
+        batch_size=[5],
+    )
+    graph = ModelGraph(
+        obs,
+        {"actor": ["policy", "last_action", "command"]},
+        "actor",
+        3,
+        nodes={
+            "temporal_encoder": {
+                "cell": {
+                    "class_name": "InterleavedCausalAttentionCell",
+                    "input_mode": "list",
+                    "output_dim": 32,
+                    "num_heads": 4,
+                    "ffn_dim": 64,
+                }
+            },
+            "command_encoder": {
+                "cell": {"class_name": "MLPCell", "hidden_dims": [16], "output_dim": 16}
+            },
+            "decoder": {"cell": {"class_name": "MLPCell", "hidden_dims": [32, 16]}},
+        },
+        routes=[
+            {"source": "inputs.policy", "target": "nodes.temporal_encoder.input"},
+            {"source": "inputs.last_action", "target": "nodes.temporal_encoder.input"},
+            {"source": "inputs.command", "target": "nodes.command_encoder.input"},
+            {"source": "nodes.temporal_encoder.output", "target": "nodes.decoder.input"},
+            {"source": "nodes.command_encoder.output", "target": "nodes.decoder.input"},
+        ],
+        output="nodes.decoder.output",
+    )
+
+    output = graph(obs)
+    output.square().mean().backward()
+
+    assert output.shape == (5, 3)
+    assert graph.nodes["decoder"].input_dim == 48
+    assert graph.nodes["temporal_encoder"].input_dim == [12, 6]
+    assert graph.nodes["temporal_encoder"].readout_token.grad is not None
