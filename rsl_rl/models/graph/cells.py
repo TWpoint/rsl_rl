@@ -335,6 +335,7 @@ class CommandSelfAttentionCell(nn.Module):
         normalization_eps: float = 1.0e-6,
         attention_residual: bool = True,
         ffn_residual: bool = True,
+        use_ffn: bool = True,
     ) -> None:
         super().__init__()
         if len(input_dim) != 2:
@@ -352,6 +353,7 @@ class CommandSelfAttentionCell(nn.Module):
         self.head_dim = output_dim // num_heads
         self.attention_residual = attention_residual
         self.ffn_residual = ffn_residual
+        self.use_ffn = use_ffn
         self.readout_projection = nn.Linear(input_dim[0], output_dim)
         self.command_projection = nn.Linear(input_dim[1], output_dim)
         norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
@@ -360,16 +362,17 @@ class CommandSelfAttentionCell(nn.Module):
         self.key_value_projection = nn.Linear(output_dim, 2 * output_dim)
         self.output_projection = nn.Linear(output_dim, output_dim)
         self.attention_dropout = dropout
-        self.ffn_norm = norm_class(output_dim, eps=normalization_eps)
-        hidden_dim = ffn_dim or 4 * output_dim
-        activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
-        self.ffn = nn.Sequential(
-            nn.Linear(output_dim, hidden_dim),
-            activation_layer(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Dropout(dropout),
-        )
+        if use_ffn:
+            self.ffn_norm = norm_class(output_dim, eps=normalization_eps)
+            hidden_dim = ffn_dim or 4 * output_dim
+            activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
+            self.ffn = nn.Sequential(
+                nn.Linear(output_dim, hidden_dim),
+                activation_layer(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+                nn.Dropout(dropout),
+            )
 
     def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
         readout_input, command_input = input
@@ -404,8 +407,10 @@ class CommandSelfAttentionCell(nn.Module):
         attended = attended.transpose(1, 2).reshape(batch_size, num_commands, self.output_dim)
         attended = self.output_projection(attended)
         encoded = commands + attended if self.attention_residual else attended
-        ffn_output = self.ffn(self.ffn_norm(encoded))
-        return encoded + ffn_output if self.ffn_residual else ffn_output
+        if self.use_ffn:
+            ffn_output = self.ffn(self.ffn_norm(encoded))
+            encoded = encoded + ffn_output if self.ffn_residual else ffn_output
+        return encoded
 
 
 class CrossAttentionCell(nn.Module):
