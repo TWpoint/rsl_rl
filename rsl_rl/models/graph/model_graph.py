@@ -9,11 +9,15 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.models.graph.cells import (
+    CrossAttentionCell,
     InterleavedCausalAttentionCell,
     MLPCell,
     TemporalAttentionCell,
+    TokenAddCell,
     TokenMergeCell,
+    TokenMLPCell,
     TokenProjectionCell,
+    TopologyProjectionCell,
 )
 from rsl_rl.modules import EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution
@@ -250,10 +254,18 @@ class ModelGraph(nn.Module):
             return MLPCell
         if class_name == "TokenProjectionCell":
             return TokenProjectionCell
+        if class_name == "TokenMLPCell":
+            return TokenMLPCell
+        if class_name == "TopologyProjectionCell":
+            return TopologyProjectionCell
+        if class_name == "TokenAddCell":
+            return TokenAddCell
         if class_name == "TokenMergeCell":
             return TokenMergeCell
         if class_name == "TemporalAttentionCell":
             return TemporalAttentionCell
         if class_name == "InterleavedCausalAttentionCell":
             return InterleavedCausalAttentionCell
+        if class_name == "CrossAttentionCell":
+            return CrossAttentionCell
         return resolve_callable(class_name)

@@ -168,6 +168,70 @@ def test_token_projection_before_temporal_attention():
     assert output.shape == (5, 3)
     assert graph.nodes["policy_projection"].projection.weight.shape == (128, 12)
     assert graph.nodes["temporal_encoder"].input_dim == 128
+
+
+def test_cross_attention_from_temporal_query_to_command_tokens():
+    obs = TensorDict(
+        {"policy": torch.randn(5, 10, 12), "command": torch.randn(5, 14, 81)}, batch_size=[5]
+    )
+    graph = ModelGraph(
+        obs,
+        {"actor": ["policy", "command"]},
+        "actor",
+        3,
+        nodes={
+            "temporal_encoder": {
+                "cell": {"class_name": "TemporalAttentionCell", "output_dim": 32, "num_heads": 4}
+            },
+            "command_projection": {
+                "cell": {
+                    "class_name": "TokenMLPCell",
+                    "hidden_dims": [64],
+                    "output_dim": 32,
+                }
+            },
+            "topology_projection": {
+                "cell": {
+                    "class_name": "TopologyProjectionCell",
+                    "output_dim": 32,
+                    "topology": [[0, 0, 0]] * 14,
+                }
+            },
+            "command_token_adder": {
+                "cell": {"class_name": "TokenAddCell", "input_mode": "list", "output_dim": 32}
+            },
+            "command_encoder": {
+                "cell": {
+                    "class_name": "CrossAttentionCell",
+                    "input_mode": "list",
+                    "output_dim": 32,
+                    "num_heads": 4,
+                    "ffn_dim": 64,
+                }
+            },
+            "decoder": {"cell": {"class_name": "MLPCell", "hidden_dims": [16]}},
+        },
+        routes=[
+            {"source": "inputs.policy", "target": "nodes.temporal_encoder.input"},
+            {"source": "inputs.command", "target": "nodes.command_projection.input"},
+            {"source": "inputs.command", "target": "nodes.topology_projection.input"},
+            {"source": "nodes.command_projection.output", "target": "nodes.command_token_adder.input"},
+            {"source": "nodes.topology_projection.output", "target": "nodes.command_token_adder.input"},
+            {"source": "nodes.temporal_encoder.output", "target": "nodes.command_encoder.input"},
+            {"source": "nodes.command_token_adder.output", "target": "nodes.command_encoder.input"},
+            {"source": "nodes.command_encoder.output", "target": "nodes.decoder.input"},
+        ],
+        output="nodes.decoder.output",
+    )
+
+    output = graph(obs)
+    output.square().mean().backward()
+
+    assert output.shape == (5, 3)
+    assert graph.nodes["command_projection"].input_dim == 81
+    assert graph.nodes["command_encoder"].input_dim == [32, 32]
+    assert graph.nodes["command_encoder"].query_projection.weight.grad is not None
+    assert graph.nodes["topology_projection"].projection.weight.grad is not None
     assert graph.nodes["policy_projection"].projection.weight.grad is not None
 
 
