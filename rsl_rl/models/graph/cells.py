@@ -47,6 +47,70 @@ class TokenProjectionCell(nn.Module):
         return self.projection(input)
 
 
+class TokenMergeCell(nn.Module):
+    """Merge two rank-3 token tensors by interleaving or concatenating them."""
+
+    def __init__(
+        self,
+        input_dim: tuple[int, int] | list[int],
+        output_dim: int,
+        mode: str = "interleave",
+        dim: int = 1,
+    ) -> None:
+        super().__init__()
+        if len(input_dim) != 2:
+            raise ValueError("TokenMergeCell requires exactly two inputs.")
+        if mode not in {"interleave", "concatenate"}:
+            raise ValueError("TokenMergeCell mode must be 'interleave' or 'concatenate'.")
+        expected_output_dim = self.infer_output_dim(input_dim, dim=dim)
+        if output_dim != expected_output_dim:
+            raise ValueError(
+                f"TokenMergeCell output_dim must be {expected_output_dim} when dim={dim}, got {output_dim}."
+            )
+        self.input_dim = list(input_dim)
+        self.output_dim = output_dim
+        self.mode = mode
+        self.dim = dim % 3
+
+    @staticmethod
+    def infer_output_dim(input_dim: tuple[int, int] | list[int], dim: int = 1, **_) -> int:
+        """Infer the trailing feature dimension after merging the inputs."""
+        normalized_dim = dim % 3
+        if normalized_dim == 0:
+            raise ValueError("TokenMergeCell cannot merge along the batch dimension.")
+        if normalized_dim == 2:
+            return sum(input_dim)
+        if input_dim[0] != input_dim[1]:
+            raise ValueError(
+                "TokenMergeCell feature dimensions must match when merging along the token dimension."
+            )
+        return input_dim[0]
+
+    def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
+        first, second = input
+        if first.ndim != 3 or second.ndim != 3:
+            raise ValueError(
+                "TokenMergeCell inputs must both be rank-3 tensors."
+            )
+        if any(first.shape[index] != second.shape[index] for index in range(3) if index != self.dim):
+            raise ValueError("TokenMergeCell input shapes must match outside the merge dimension.")
+        if self.mode == "concatenate":
+            return torch.cat((first, second), dim=self.dim)
+
+        if first.shape[self.dim] != second.shape[self.dim] + 1:
+            raise ValueError(
+                "TokenMergeCell interleave mode requires the first input to have exactly one "
+                f"more element along dim={self.dim}; got {first.shape[self.dim]} and "
+                f"{second.shape[self.dim]}."
+            )
+        paired = torch.stack(
+            (first.narrow(self.dim, 0, second.shape[self.dim]), second),
+            dim=self.dim + 1,
+        ).flatten(self.dim, self.dim + 1)
+        tail = first.narrow(self.dim, first.shape[self.dim] - 1, 1)
+        return torch.cat((paired, tail), dim=self.dim)
+
+
 class TemporalAttentionCell(nn.Module):
     """Encode a temporal observation with a trailing learnable readout token.
 

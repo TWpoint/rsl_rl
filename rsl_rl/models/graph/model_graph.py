@@ -12,6 +12,7 @@ from rsl_rl.models.graph.cells import (
     InterleavedCausalAttentionCell,
     MLPCell,
     TemporalAttentionCell,
+    TokenMergeCell,
     TokenProjectionCell,
 )
 from rsl_rl.modules import EmpiricalNormalization, HiddenState
@@ -86,14 +87,17 @@ class ModelGraph(nn.Module):
             if input_mode not in {"concat", "list"}:
                 raise ValueError(f"Unsupported input_mode '{input_mode}' for node '{node_name}'.")
             self._node_input_modes[node_name] = input_mode
+            cell_class = self._resolve_cell(cell_class_name)
+            cell_input_dim = [endpoint_dims[source] for source in sources] if input_mode == "list" else input_dim
             node_output_dim = cell_cfg.pop("output_dim", None)
             endpoint = f"nodes.{node_name}.output"
             if node_output_dim is None:
-                if endpoint != self.output_endpoint:
+                if endpoint == self.output_endpoint:
+                    node_output_dim = graph_output_dim
+                elif hasattr(cell_class, "infer_output_dim"):
+                    node_output_dim = cell_class.infer_output_dim(cell_input_dim, **cell_cfg)
+                else:
                     raise ValueError(f"Node '{node_name}' must define cell.output_dim because it is not graph output.")
-                node_output_dim = graph_output_dim
-            cell_class = self._resolve_cell(cell_class_name)
-            cell_input_dim = [endpoint_dims[source] for source in sources] if input_mode == "list" else input_dim
             self.nodes[node_name] = cell_class(input_dim=cell_input_dim, output_dim=node_output_dim, **cell_cfg)
             endpoint_dims[endpoint] = node_output_dim
 
@@ -246,6 +250,8 @@ class ModelGraph(nn.Module):
             return MLPCell
         if class_name == "TokenProjectionCell":
             return TokenProjectionCell
+        if class_name == "TokenMergeCell":
+            return TokenMergeCell
         if class_name == "TemporalAttentionCell":
             return TemporalAttentionCell
         if class_name == "InterleavedCausalAttentionCell":

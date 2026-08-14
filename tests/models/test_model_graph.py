@@ -3,6 +3,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.models import ModelGraph
+from rsl_rl.models.graph.cells import TokenMergeCell
 from rsl_rl.models.mlp_model import MLPModel
 
 
@@ -168,6 +169,91 @@ def test_token_projection_before_temporal_attention():
     assert graph.nodes["policy_projection"].projection.weight.shape == (128, 12)
     assert graph.nodes["temporal_encoder"].input_dim == 128
     assert graph.nodes["policy_projection"].projection.weight.grad is not None
+
+
+def test_projected_observation_and_action_tokens_are_interleaved():
+    obs = TensorDict(
+        {
+            "policy": torch.randn(5, 5, 12),
+            "action": torch.randn(5, 4, 6),
+        },
+        batch_size=[5],
+    )
+    graph = ModelGraph(
+        obs,
+        {"actor": ["policy", "action"]},
+        "actor",
+        3,
+        nodes={
+            "policy_projection": {
+                "cell": {"class_name": "TokenProjectionCell", "output_dim": 128}
+            },
+            "action_projection": {
+                "cell": {"class_name": "TokenProjectionCell", "output_dim": 128}
+            },
+            "token_interleaver": {
+                "cell": {
+                    "class_name": "TokenMergeCell",
+                    "input_mode": "list",
+                    "mode": "interleave",
+                    "dim": 1,
+                }
+            },
+            "temporal_encoder": {
+                "cell": {
+                    "class_name": "TemporalAttentionCell",
+                    "output_dim": 32,
+                    "num_heads": 4,
+                }
+            },
+            "decoder": {"cell": {"class_name": "MLPCell", "hidden_dims": [16]}},
+        },
+        routes=[
+            {"source": "inputs.policy", "target": "nodes.policy_projection.input"},
+            {"source": "inputs.action", "target": "nodes.action_projection.input"},
+            {
+                "source": "nodes.policy_projection.output",
+                "target": "nodes.token_interleaver.input",
+            },
+            {
+                "source": "nodes.action_projection.output",
+                "target": "nodes.token_interleaver.input",
+            },
+            {
+                "source": "nodes.token_interleaver.output",
+                "target": "nodes.temporal_encoder.input",
+            },
+            {"source": "nodes.temporal_encoder.output", "target": "nodes.decoder.input"},
+        ],
+        output="nodes.decoder.output",
+    )
+
+    policy_tokens = graph.nodes["policy_projection"](obs["policy"])
+    action_tokens = graph.nodes["action_projection"](obs["action"])
+    interleaved = graph.nodes["token_interleaver"]([policy_tokens, action_tokens])
+    torch.testing.assert_close(interleaved[:, 0::2], policy_tokens)
+    torch.testing.assert_close(interleaved[:, 1::2], action_tokens)
+
+    output = graph(obs)
+    output.square().mean().backward()
+
+    assert output.shape == (5, 3)
+    assert interleaved.shape == (5, 9, 128)
+    assert graph.nodes["policy_projection"].projection.weight.grad is not None
+    assert graph.nodes["action_projection"].projection.weight.grad is not None
+
+
+def test_token_merge_mode_and_dimension_are_configurable():
+    first = torch.randn(5, 4, 12)
+    second = torch.randn(5, 4, 6)
+    merge = TokenMergeCell(
+        input_dim=[12, 6],
+        output_dim=18,
+        mode="concatenate",
+        dim=-1,
+    )
+
+    torch.testing.assert_close(merge([first, second]), torch.cat((first, second), dim=-1))
 
 
 def test_interleaved_causal_attention_with_non_concatenated_action_group():
