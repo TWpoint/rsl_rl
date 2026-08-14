@@ -193,8 +193,8 @@ class TemporalAttentionCell(nn.Module):
 
     Rotary position embeddings are applied to the queries and keys of every
     token, including the learnable token appended after the observation
-    sequence. The cell returns only that token after attention and FFN
-    residual blocks.
+    sequence. The cell returns only that token after attention and, when
+    enabled, an FFN residual block.
     """
 
     def __init__(
@@ -210,6 +210,7 @@ class TemporalAttentionCell(nn.Module):
         normalization_eps: float = 1.0e-6,
         attention_residual: bool = True,
         ffn_residual: bool = True,
+        use_ffn: bool = True,
         rope_base: float = 10000.0,
     ) -> None:
         super().__init__()
@@ -236,6 +237,7 @@ class TemporalAttentionCell(nn.Module):
         self.position_embedding = position_embedding
         self.attention_residual = attention_residual
         self.ffn_residual = ffn_residual
+        self.use_ffn = use_ffn
         self.input_projection = nn.Linear(input_dim, output_dim)
         self.readout_token = nn.Parameter(torch.zeros(1, 1, output_dim))
         norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
@@ -247,16 +249,17 @@ class TemporalAttentionCell(nn.Module):
         self.key_value_projection = nn.Linear(output_dim, 2 * output_dim)
         self.output_projection = nn.Linear(output_dim, output_dim)
         self.attention_dropout = dropout
-        self.ffn_norm = norm_class(output_dim, eps=normalization_eps)
-        hidden_dim = ffn_dim or 4 * output_dim
-        activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
-        self.ffn = nn.Sequential(
-            nn.Linear(output_dim, hidden_dim),
-            activation_layer(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Dropout(dropout),
-        )
+        if use_ffn:
+            self.ffn_norm = norm_class(output_dim, eps=normalization_eps)
+            hidden_dim = ffn_dim or 4 * output_dim
+            activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
+            self.ffn = nn.Sequential(
+                nn.Linear(output_dim, hidden_dim),
+                activation_layer(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+                nn.Dropout(dropout),
+            )
         nn.init.normal_(self.readout_token, std=0.02)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -288,8 +291,9 @@ class TemporalAttentionCell(nn.Module):
         attended = attended.transpose(1, 2).reshape(batch_size, 1, self.output_dim)
         attended = self.output_projection(attended)
         readout = tokens[:, -1:] + attended if self.attention_residual else attended
-        ffn_output = self.ffn(self.ffn_norm(readout))
-        readout = readout + ffn_output if self.ffn_residual else ffn_output
+        if self.use_ffn:
+            ffn_output = self.ffn(self.ffn_norm(readout))
+            readout = readout + ffn_output if self.ffn_residual else ffn_output
         return readout[:, 0]
 
     def _apply_rope(self, tensor: torch.Tensor, position_offset: int = 0) -> torch.Tensor:

@@ -128,10 +128,41 @@ def test_temporal_attention_and_command_branches():
 
     output = graph(obs)
     output.square().mean().backward()
-
     assert output.shape == (5, 3)
     assert graph.nodes["decoder"].input_dim == 48
     assert graph.nodes["temporal_encoder"].readout_token.grad is not None
+
+
+def test_temporal_attention_without_ffn():
+    obs = TensorDict({"policy": torch.randn(5, 10, 12)}, batch_size=[5])
+    graph = ModelGraph(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        3,
+        nodes={
+            "temporal_encoder": {
+                "cell": {
+                    "class_name": "TemporalAttentionCell",
+                    "output_dim": 32,
+                    "num_heads": 4,
+                    "use_ffn": False,
+                }
+            },
+            "decoder": {"cell": {"class_name": "MLPCell", "hidden_dims": [16]}},
+        },
+        routes=[
+            {"source": "inputs.policy", "target": "nodes.temporal_encoder.input"},
+            {"source": "nodes.temporal_encoder.output", "target": "nodes.decoder.input"},
+        ],
+        output="nodes.decoder.output",
+    )
+
+    temporal_encoder = graph.nodes["temporal_encoder"]
+    assert not hasattr(temporal_encoder, "ffn")
+    output = graph(obs)
+    assert output.shape == (5, 3)
+    output.square().mean().backward()
 
 
 def test_token_projection_before_temporal_attention():
