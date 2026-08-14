@@ -315,6 +315,99 @@ class TemporalAttentionCell(nn.Module):
         return torch.stack((even * cosine - odd * sine, odd * cosine + even * sine), dim=-1).flatten(-2)
 
 
+class CommandSelfAttentionCell(nn.Module):
+    """Update command tokens by attending over an unchanged readout and the commands.
+
+    The readout participates as context but is not part of the output. Only the
+    command positions are queried and updated, so the original readout can be
+    passed unchanged to a following cross-attention block.
+    """
+
+    def __init__(
+        self,
+        input_dim: tuple[int, int] | list[int],
+        output_dim: int,
+        num_heads: int = 4,
+        ffn_dim: int | None = None,
+        activation: str = "gelu",
+        dropout: float = 0.0,
+        normalization: str = "rms_norm",
+        normalization_eps: float = 1.0e-6,
+        attention_residual: bool = True,
+        ffn_residual: bool = True,
+    ) -> None:
+        super().__init__()
+        if len(input_dim) != 2:
+            raise ValueError("CommandSelfAttentionCell requires readout and command inputs.")
+        if output_dim % num_heads != 0:
+            raise ValueError("CommandSelfAttentionCell output_dim must be divisible by num_heads.")
+        if activation not in {"gelu", "relu", "silu"}:
+            raise ValueError(f"Unsupported CommandSelfAttentionCell activation '{activation}'.")
+        if normalization not in {"rms_norm", "layer_norm"}:
+            raise ValueError("CommandSelfAttentionCell normalization must be 'rms_norm' or 'layer_norm'.")
+
+        self.input_dim = list(input_dim)
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.head_dim = output_dim // num_heads
+        self.attention_residual = attention_residual
+        self.ffn_residual = ffn_residual
+        self.readout_projection = nn.Linear(input_dim[0], output_dim)
+        self.command_projection = nn.Linear(input_dim[1], output_dim)
+        norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
+        self.attention_norm = norm_class(output_dim, eps=normalization_eps)
+        self.query_projection = nn.Linear(output_dim, output_dim)
+        self.key_value_projection = nn.Linear(output_dim, 2 * output_dim)
+        self.output_projection = nn.Linear(output_dim, output_dim)
+        self.attention_dropout = dropout
+        self.ffn_norm = norm_class(output_dim, eps=normalization_eps)
+        hidden_dim = ffn_dim or 4 * output_dim
+        activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
+        self.ffn = nn.Sequential(
+            nn.Linear(output_dim, hidden_dim),
+            activation_layer(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
+        readout_input, command_input = input
+        if readout_input.ndim != 2:
+            raise ValueError(
+                f"CommandSelfAttentionCell readout expects [B, D], got {tuple(readout_input.shape)}."
+            )
+        if command_input.ndim != 3:
+            raise ValueError(
+                f"CommandSelfAttentionCell commands expect [B, N, D], got {tuple(command_input.shape)}."
+            )
+        if readout_input.shape[0] != command_input.shape[0]:
+            raise ValueError("CommandSelfAttentionCell input batch sizes must match.")
+
+        batch_size, num_commands = command_input.shape[:2]
+        readout = self.readout_projection(readout_input).unsqueeze(1)
+        commands = self.command_projection(command_input)
+        context = torch.cat((readout, commands), dim=1)
+        query = self.query_projection(self.attention_norm(commands)).reshape(
+            batch_size, num_commands, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_value = self.key_value_projection(self.attention_norm(context)).reshape(
+            batch_size, num_commands + 1, 2, self.num_heads, self.head_dim
+        )
+        key, value = key_value.permute(2, 0, 3, 1, 4).unbind(0)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch_size, num_commands, self.output_dim)
+        attended = self.output_projection(attended)
+        encoded = commands + attended if self.attention_residual else attended
+        ffn_output = self.ffn(self.ffn_norm(encoded))
+        return encoded + ffn_output if self.ffn_residual else ffn_output
+
+
 class CrossAttentionCell(nn.Module):
     """Attend from one query feature to a sequence of context tokens."""
 

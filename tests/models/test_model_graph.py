@@ -266,6 +266,55 @@ def test_cross_attention_from_temporal_query_to_command_tokens():
     assert graph.nodes["policy_projection"].projection.weight.grad is not None
 
 
+def test_command_self_attention_updates_only_commands_before_cross_attention():
+    obs = TensorDict(
+        {"readout": torch.randn(5, 32), "command": torch.randn(5, 14, 32)}, batch_size=[5]
+    )
+    graph = ModelGraph(
+        obs,
+        {"actor": ["readout", "command"]},
+        "actor",
+        3,
+        nodes={
+            "command_self_attention": {
+                "cell": {
+                    "class_name": "CommandSelfAttentionCell",
+                    "input_mode": "list",
+                    "output_dim": 32,
+                    "num_heads": 4,
+                    "ffn_dim": 64,
+                }
+            },
+            "command_encoder": {
+                "cell": {
+                    "class_name": "CrossAttentionCell",
+                    "input_mode": "list",
+                    "output_dim": 32,
+                    "num_heads": 4,
+                }
+            },
+            "decoder": {"cell": {"class_name": "MLPCell", "hidden_dims": [16]}},
+        },
+        routes=[
+            {"source": "inputs.readout", "target": "nodes.command_self_attention.input"},
+            {"source": "inputs.command", "target": "nodes.command_self_attention.input"},
+            {"source": "inputs.readout", "target": "nodes.command_encoder.input"},
+            {"source": "nodes.command_self_attention.output", "target": "nodes.command_encoder.input"},
+            {"source": "nodes.command_encoder.output", "target": "nodes.decoder.input"},
+        ],
+        output="nodes.decoder.output",
+    )
+
+    original_readout = obs["readout"].clone()
+    updated_commands = graph.nodes["command_self_attention"]([obs["readout"], obs["command"]])
+    assert updated_commands.shape == (5, 14, 32)
+    torch.testing.assert_close(obs["readout"], original_readout)
+    output = graph(obs)
+    output.square().mean().backward()
+    assert output.shape == (5, 3)
+    assert graph.nodes["command_self_attention"].key_value_projection.weight.grad is not None
+
+
 def test_projected_observation_and_action_tokens_are_interleaved():
     obs = TensorDict(
         {

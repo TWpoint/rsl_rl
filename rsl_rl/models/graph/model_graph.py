@@ -9,6 +9,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from rsl_rl.models.graph.cells import (
+    CommandSelfAttentionCell,
     CrossAttentionCell,
     InterleavedCausalAttentionCell,
     MLPCell,
@@ -264,6 +265,8 @@ class ModelGraph(nn.Module):
             return TokenMergeCell
         if class_name == "TemporalAttentionCell":
             return TemporalAttentionCell
+        if class_name == "CommandSelfAttentionCell":
+            return CommandSelfAttentionCell
         if class_name == "InterleavedCausalAttentionCell":
             return InterleavedCausalAttentionCell
         if class_name == "CrossAttentionCell":
