@@ -16,7 +16,7 @@ class DistillationRunner(OnPolicyRunner):
     alg: Distillation
     """The distillation algorithm."""
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
+    def learn(self, num_learning_iterations: int | None, init_at_random_ep_len: bool = False) -> None:
         """Run the learning loop after validating that the teacher model is loaded."""
         # Check if teacher is loaded
         if not self.alg.teacher_loaded:

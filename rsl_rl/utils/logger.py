@@ -157,7 +157,7 @@ class Logger:
         self,
         it: int,
         start_it: int,
-        total_it: int,
+        total_it: int | None,
         collect_time: float,
         learn_time: float,
         loss_dict: dict,
@@ -234,7 +234,10 @@ class Logger:
 
             # Print to console
             log_string = f"""{"#" * width}\n"""
-            log_string += f"""\033[1m{f" Learning iteration {it}/{total_it} ".center(width)}\033[0m \n\n"""
+            iteration_label = (
+                f"Learning iteration {it}/{total_it}" if total_it is not None else f"Learning iteration {it}"
+            )
+            log_string += f"""\033[1m{f" {iteration_label} ".center(width)}\033[0m \n\n"""
 
             # Print run name if provided
             run_name = self.cfg.get("run_name")
@@ -269,13 +272,18 @@ class Logger:
 
             # Print footer
             done_it = it + 1 - start_it
-            remaining_it = total_it - start_it - done_it
-            eta = self.tot_time / done_it * remaining_it
+            if total_it is None:
+                eta_label = "Estimated time (10k it):"
+                eta = self.tot_time / done_it * 10_000
+            else:
+                eta_label = "ETA:"
+                remaining_it = total_it - start_it - done_it
+                eta = self.tot_time / done_it * remaining_it
             log_string += (
                 f"""{"-" * width}\n"""
                 f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
                 f"""{"Time elapsed:":>{pad}} {datetime.timedelta(seconds=int(self.tot_time))}\n"""
-                f"""{"ETA:":>{pad}} {datetime.timedelta(seconds=int(eta))}\n"""
+                f"""{eta_label:>{pad}} {datetime.timedelta(seconds=int(eta))}\n"""
             )
             print(log_string)
 

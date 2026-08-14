@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+from itertools import count
 import torch
 
 from rsl_rl.algorithms import PPO
@@ -53,8 +54,8 @@ class OnPolicyRunner:
 
         self.current_learning_iteration = 0
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
-        """Run the learning loop for the specified number of iterations."""
+    def learn(self, num_learning_iterations: int | None, init_at_random_ep_len: bool = False) -> None:
+        """Run for the specified number of iterations, or indefinitely when unset."""
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
@@ -75,8 +76,9 @@ class OnPolicyRunner:
 
         # Start training
         start_it = self.current_learning_iteration
-        total_it = start_it + num_learning_iterations
-        for it in range(start_it, total_it):
+        total_it = start_it + num_learning_iterations if num_learning_iterations is not None else None
+        iterations = range(start_it, total_it) if total_it is not None else count(start_it)
+        for it in iterations:
             start = time.time()
             # Rollout
             with torch.inference_mode():
