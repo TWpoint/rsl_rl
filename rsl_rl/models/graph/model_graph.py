@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.models.graph.cells import InterleavedCausalAttentionCell, MLPCell, TemporalAttentionCell
+from rsl_rl.models.graph.cells import (
+    InterleavedCausalAttentionCell,
+    MLPCell,
+    TemporalAttentionCell,
+    TokenProjectionCell,
+)
 from rsl_rl.modules import EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable, unpad_trajectories
@@ -239,6 +244,8 @@ class ModelGraph(nn.Module):
     def _resolve_cell(class_name: str):
         if class_name == "MLPCell":
             return MLPCell
+        if class_name == "TokenProjectionCell":
+            return TokenProjectionCell
         if class_name == "TemporalAttentionCell":
             return TemporalAttentionCell
         if class_name == "InterleavedCausalAttentionCell":

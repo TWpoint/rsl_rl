@@ -30,6 +30,23 @@ class MLPCell(nn.Module):
         return self.mlp(input)
 
 
+class TokenProjectionCell(nn.Module):
+    """Project every token in a rank-3 sequence to a shared feature dimension."""
+
+    def __init__(self, input_dim: int, output_dim: int) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.projection = nn.Linear(input_dim, output_dim)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if input.ndim != 3:
+            raise ValueError(
+                f"TokenProjectionCell expects [B, T, D], got shape {tuple(input.shape)}."
+            )
+        return self.projection(input)
+
+
 class TemporalAttentionCell(nn.Module):
     """Encode a temporal observation with a trailing learnable readout token.
 

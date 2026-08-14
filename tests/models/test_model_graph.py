@@ -133,6 +133,43 @@ def test_temporal_attention_and_command_branches():
     assert graph.nodes["temporal_encoder"].readout_token.grad is not None
 
 
+def test_token_projection_before_temporal_attention():
+    obs = TensorDict({"policy": torch.randn(5, 5, 12)}, batch_size=[5])
+    graph = ModelGraph(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        3,
+        nodes={
+            "policy_projection": {
+                "cell": {"class_name": "TokenProjectionCell", "output_dim": 128}
+            },
+            "temporal_encoder": {
+                "cell": {
+                    "class_name": "TemporalAttentionCell",
+                    "output_dim": 32,
+                    "num_heads": 4,
+                }
+            },
+            "decoder": {"cell": {"class_name": "MLPCell", "hidden_dims": [16]}},
+        },
+        routes=[
+            {"source": "inputs.policy", "target": "nodes.policy_projection.input"},
+            {"source": "nodes.policy_projection.output", "target": "nodes.temporal_encoder.input"},
+            {"source": "nodes.temporal_encoder.output", "target": "nodes.decoder.input"},
+        ],
+        output="nodes.decoder.output",
+    )
+
+    output = graph(obs)
+    output.square().mean().backward()
+
+    assert output.shape == (5, 3)
+    assert graph.nodes["policy_projection"].projection.weight.shape == (128, 12)
+    assert graph.nodes["temporal_encoder"].input_dim == 128
+    assert graph.nodes["policy_projection"].projection.weight.grad is not None
+
+
 def test_interleaved_causal_attention_with_non_concatenated_action_group():
     obs = TensorDict(
         {
