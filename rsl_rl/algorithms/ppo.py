@@ -44,6 +44,8 @@ class PPO:
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
+        actor_learning_rate: float | None = None,
+        critic_learning_rate: float | None = None,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
         use_clipped_value_loss: bool = True,
@@ -88,10 +90,28 @@ class PPO:
         self._raw_actor = self.actor
         self._raw_critic = self.critic
 
-        # Create the optimizer
-        self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
-        )  # type: ignore
+        # Create the optimizer. Keep the legacy single parameter group unless a separate
+        # actor or critic learning rate is explicitly requested so old checkpoints remain loadable.
+        self.actor_learning_rate = learning_rate if actor_learning_rate is None else actor_learning_rate
+        self.critic_learning_rate = learning_rate if critic_learning_rate is None else critic_learning_rate
+        self._separate_learning_rates = actor_learning_rate is not None or critic_learning_rate is not None
+        optimizer_class = resolve_optimizer(optimizer)
+        if self._separate_learning_rates:
+            actor_parameters = list(self.actor.parameters())
+            critic_parameters = list(self.critic.parameters())
+            actor_parameter_ids = {id(parameter) for parameter in actor_parameters}
+            if any(id(parameter) in actor_parameter_ids for parameter in critic_parameters):
+                raise ValueError("Separate actor/critic learning rates do not support shared model parameters.")
+            self.optimizer = optimizer_class(
+                [
+                    {"params": actor_parameters, "lr": self.actor_learning_rate, "name": "actor"},
+                    {"params": critic_parameters, "lr": self.critic_learning_rate, "name": "critic"},
+                ]
+            )
+        else:
+            self.optimizer = optimizer_class(
+                chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            )  # type: ignore
 
         # Add storage
         self.storage = storage
@@ -109,8 +129,30 @@ class PPO:
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
         self.schedule = schedule
-        self.learning_rate = learning_rate
+        # Backward-compatible alias used by the runner and existing loggers.
+        self.learning_rate = self.actor_learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
+    def _adapt_learning_rate(self, kl_mean: torch.Tensor) -> None:
+        """Adapt the actor learning rate from policy KL while leaving a split critic rate fixed."""
+        if self.gpu_global_rank == 0:
+            if kl_mean > self.desired_kl * 2.0:
+                self.actor_learning_rate = max(1e-5, self.actor_learning_rate / 1.5)
+            elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                self.actor_learning_rate = min(1e-2, self.actor_learning_rate * 1.5)
+
+        if self.is_multi_gpu:
+            lr_tensor = torch.tensor(self.actor_learning_rate, device=self.device)
+            torch.distributed.broadcast(lr_tensor, src=0)
+            self.actor_learning_rate = lr_tensor.item()
+
+        self.learning_rate = self.actor_learning_rate
+        if self._separate_learning_rates:
+            self.optimizer.param_groups[0]["lr"] = self.actor_learning_rate
+        else:
+            self.critic_learning_rate = self.actor_learning_rate
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.actor_learning_rate
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -241,22 +283,7 @@ class PPO:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
 
-                    # Update the learning rate only on the main process
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
-
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
-
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                    self._adapt_learning_rate(kl_mean)
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore

@@ -318,3 +318,47 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+class TestSeparateLearningRates:
+    """Tests for optional actor/critic optimizer parameter groups."""
+
+    def test_legacy_learning_rate_keeps_single_parameter_group(self) -> None:
+        ppo, _obs = _build_ppo(learning_rate=3e-4)
+
+        assert len(ppo.optimizer.param_groups) == 1
+        assert ppo.actor_learning_rate == 3e-4
+        assert ppo.critic_learning_rate == 3e-4
+        assert ppo.optimizer.param_groups[0]["lr"] == 3e-4
+
+    def test_separate_learning_rates_create_actor_and_critic_groups(self) -> None:
+        ppo, _obs = _build_ppo(actor_learning_rate=5e-5, critic_learning_rate=5e-4)
+
+        assert [group["name"] for group in ppo.optimizer.param_groups] == ["actor", "critic"]
+        assert [group["lr"] for group in ppo.optimizer.param_groups] == [5e-5, 5e-4]
+        actor_parameter_ids = {id(parameter) for parameter in ppo.actor.parameters()}
+        critic_parameter_ids = {id(parameter) for parameter in ppo.critic.parameters()}
+        assert {id(parameter) for parameter in ppo.optimizer.param_groups[0]["params"]} == actor_parameter_ids
+        assert {id(parameter) for parameter in ppo.optimizer.param_groups[1]["params"]} == critic_parameter_ids
+
+    def test_adaptive_schedule_changes_only_split_actor_rate(self) -> None:
+        ppo, _obs = _build_ppo(
+            schedule="adaptive",
+            desired_kl=0.01,
+            actor_learning_rate=5e-5,
+            critic_learning_rate=5e-4,
+        )
+
+        ppo._adapt_learning_rate(torch.tensor(0.03))
+
+        assert ppo.actor_learning_rate == 5e-5 / 1.5
+        assert ppo.critic_learning_rate == 5e-4
+        assert ppo.learning_rate == ppo.actor_learning_rate
+        assert ppo.optimizer.param_groups[0]["lr"] == ppo.actor_learning_rate
+        assert ppo.optimizer.param_groups[1]["lr"] == 5e-4
+
+    def test_unspecified_side_falls_back_to_legacy_rate(self) -> None:
+        ppo, _obs = _build_ppo(learning_rate=1e-3, actor_learning_rate=5e-5)
+
+        assert ppo.actor_learning_rate == 5e-5
+        assert ppo.critic_learning_rate == 1e-3
