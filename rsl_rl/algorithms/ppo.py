@@ -48,6 +48,7 @@ class PPO:
         critic_learning_rate: float | None = None,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
+        optimizer_fused: bool = False,
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
@@ -96,6 +97,13 @@ class PPO:
         self.critic_learning_rate = learning_rate if critic_learning_rate is None else critic_learning_rate
         self._separate_learning_rates = actor_learning_rate is not None or critic_learning_rate is not None
         optimizer_class = resolve_optimizer(optimizer)
+        optimizer_kwargs = {}
+        if optimizer_fused:
+            if optimizer.lower() not in {"adam", "adamw"}:
+                raise ValueError("optimizer_fused is only supported for Adam and AdamW.")
+            if not str(self.device).startswith("cuda"):
+                raise ValueError("optimizer_fused requires a CUDA device.")
+            optimizer_kwargs["fused"] = True
         if self._separate_learning_rates:
             actor_parameters = list(self.actor.parameters())
             critic_parameters = list(self.critic.parameters())
@@ -106,11 +114,12 @@ class PPO:
                 [
                     {"params": actor_parameters, "lr": self.actor_learning_rate, "name": "actor"},
                     {"params": critic_parameters, "lr": self.critic_learning_rate, "name": "critic"},
-                ]
+                ],
+                **optimizer_kwargs,
             )
         else:
             self.optimizer = optimizer_class(
-                chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+                chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate, **optimizer_kwargs
             )  # type: ignore
 
         # Add storage

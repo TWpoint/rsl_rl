@@ -54,6 +54,9 @@ class Logger:
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self._episode_done_masks: list[torch.Tensor] = []
+        self._episode_rewards: list[torch.Tensor] = []
+        self._episode_lengths: list[torch.Tensor] = []
 
         # Create RND buffers
         if self.cfg["algorithm"]["rnd_cfg"]:
@@ -61,6 +64,8 @@ class Logger:
             self.irewbuffer = deque(maxlen=100)
             self.cur_ereward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             self.cur_ireward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self._episode_erewards: list[torch.Tensor] = []
+            self._episode_irewards: list[torch.Tensor] = []
 
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
@@ -141,17 +146,45 @@ class Logger:
                 self.cur_reward_sum += rewards
             self.cur_episode_length += 1
 
-            # Clear data for completed episodes
-            new_ids = (dones > 0).nonzero(as_tuple=False)
-            self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-            self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-            self.cur_reward_sum[new_ids] = 0
-            self.cur_episode_length[new_ids] = 0
+            # Buffer completed episodes on the device. Converting completed
+            # indices and values to CPU here forces a CUDA synchronization on
+            # every environment step. Flush the whole rollout once in log().
+            done_mask = dones > 0
+            if self.writer is not None:
+                self._episode_done_masks.append(done_mask)
+                self._episode_rewards.append(torch.where(done_mask, self.cur_reward_sum, 0.0))
+                self._episode_lengths.append(torch.where(done_mask, self.cur_episode_length, 0.0))
+            self.cur_reward_sum.masked_fill_(done_mask, 0.0)
+            self.cur_episode_length.masked_fill_(done_mask, 0.0)
             if intrinsic_rewards is not None:
-                self.erewbuffer.extend(self.cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                self.cur_ereward_sum[new_ids] = 0
-                self.cur_ireward_sum[new_ids] = 0
+                if self.writer is not None:
+                    self._episode_erewards.append(torch.where(done_mask, self.cur_ereward_sum, 0.0))
+                    self._episode_irewards.append(torch.where(done_mask, self.cur_ireward_sum, 0.0))
+                self.cur_ereward_sum.masked_fill_(done_mask, 0.0)
+                self.cur_ireward_sum.masked_fill_(done_mask, 0.0)
+
+    def _flush_episode_buffers(self) -> None:
+        """Move completed episode statistics to CPU once per rollout."""
+        if not self._episode_done_masks:
+            return
+
+        done_masks = torch.stack(self._episode_done_masks).cpu()
+        rewards = torch.stack(self._episode_rewards).cpu()
+        lengths = torch.stack(self._episode_lengths).cpu()
+        self.rewbuffer.extend(rewards[done_masks].tolist())
+        self.lenbuffer.extend(lengths[done_masks].tolist())
+
+        if self.cfg["algorithm"]["rnd_cfg"]:
+            erewards = torch.stack(self._episode_erewards).cpu()
+            irewards = torch.stack(self._episode_irewards).cpu()
+            self.erewbuffer.extend(erewards[done_masks].tolist())
+            self.irewbuffer.extend(irewards[done_masks].tolist())
+            self._episode_erewards.clear()
+            self._episode_irewards.clear()
+
+        self._episode_done_masks.clear()
+        self._episode_rewards.clear()
+        self._episode_lengths.clear()
 
     def log(
         self,
@@ -173,6 +206,7 @@ class Logger:
         If videos are available, they are uploaded to the logging service (W&B) as well.
         """
         if self.writer is not None:
+            self._flush_episode_buffers()
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
             self.tot_timesteps += collection_size
@@ -183,7 +217,7 @@ class Logger:
             if self.ep_extras:
                 # Iterate over all keys in the episode info dictionary
                 for key in {k for ep_info in self.ep_extras for k in ep_info}:
-                    infotensor = torch.tensor([], device=self.device)
+                    info_tensors = []
                     # Iterate over all steps
                     for ep_info in self.ep_extras:
                         # Handle missing, scalar, and zero dimensional tensors
@@ -193,7 +227,8 @@ class Logger:
                             ep_info[key] = torch.Tensor([ep_info[key]])
                         if len(ep_info[key].shape) == 0:
                             ep_info[key] = ep_info[key].unsqueeze(0)
-                        infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                        info_tensors.append(ep_info[key].to(self.device))
+                    infotensor = torch.cat(info_tensors)
                     value = torch.mean(infotensor)
                     if "/" in key:
                         self.writer.add_scalar(key, value, it)  # type: ignore

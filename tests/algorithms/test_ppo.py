@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from tensordict import TensorDict
 
@@ -362,3 +363,23 @@ class TestSeparateLearningRates:
 
         assert ppo.actor_learning_rate == 5e-5
         assert ppo.critic_learning_rate == 1e-3
+
+
+class TestFusedOptimizer:
+    """Tests for the optional CUDA fused optimizer path."""
+
+    def test_fused_optimizer_requires_cuda(self) -> None:
+        with pytest.raises(ValueError, match="requires a CUDA device"):
+            _build_ppo(optimizer_fused=True)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for fused Adam")
+    def test_fused_optimizer_supports_separate_learning_rates(self) -> None:
+        ppo, _obs = _build_ppo(
+            device="cuda:0",
+            optimizer_fused=True,
+            actor_learning_rate=5e-5,
+            critic_learning_rate=5e-4,
+        )
+
+        assert ppo.optimizer.defaults["fused"] is True
+        assert [group["lr"] for group in ppo.optimizer.param_groups] == [5e-5, 5e-4]
