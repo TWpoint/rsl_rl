@@ -1,10 +1,32 @@
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from rsl_rl.modules import MLP
+
+
+class LinearCell(nn.Module):
+    """A rank-2 linear projection cell used by :class:`ModelGraph`."""
+
+    def __init__(self, input_dim: int, output_dim: int) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if input.ndim != 2:
+            raise ValueError(f"LinearCell expects a rank-2 tensor [B, D], got shape {tuple(input.shape)}.")
+        return self.linear(input)
 
 
 class MLPCell(nn.Module):
@@ -41,9 +63,7 @@ class TokenProjectionCell(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim != 3:
-            raise ValueError(
-                f"TokenProjectionCell expects [B, T, D], got shape {tuple(input.shape)}."
-            )
+            raise ValueError(f"TokenProjectionCell expects [B, T, D], got shape {tuple(input.shape)}.")
         return self.projection(input)
 
 
@@ -90,9 +110,7 @@ class TopologyProjectionCell(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim != 3:
-            raise ValueError(
-                f"TopologyProjectionCell expects entity tokens [B, N, D], got shape {tuple(input.shape)}."
-            )
+            raise ValueError(f"TopologyProjectionCell expects entity tokens [B, N, D], got shape {tuple(input.shape)}.")
         if input.shape[1] != self.topology.shape[0]:
             raise ValueError(
                 f"TopologyProjectionCell expected {self.topology.shape[0]} entities, got {input.shape[1]}."
@@ -158,17 +176,13 @@ class TokenMergeCell(nn.Module):
         if normalized_dim == 2:
             return sum(input_dim)
         if input_dim[0] != input_dim[1]:
-            raise ValueError(
-                "TokenMergeCell feature dimensions must match when merging along the token dimension."
-            )
+            raise ValueError("TokenMergeCell feature dimensions must match when merging along the token dimension.")
         return input_dim[0]
 
     def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
         first, second = input
         if first.ndim != 3 or second.ndim != 3:
-            raise ValueError(
-                "TokenMergeCell inputs must both be rank-3 tensors."
-            )
+            raise ValueError("TokenMergeCell inputs must both be rank-3 tensors.")
         if any(first.shape[index] != second.shape[index] for index in range(3) if index != self.dim):
             raise ValueError("TokenMergeCell input shapes must match outside the merge dimension.")
         if self.mode == "concatenate":
@@ -222,13 +236,9 @@ class TemporalAttentionCell(nn.Module):
         if activation not in {"gelu", "relu", "silu"}:
             raise ValueError(f"Unsupported TemporalAttentionCell activation '{activation}'.")
         if position_embedding not in {"rope", "none"}:
-            raise ValueError(
-                "TemporalAttentionCell position_embedding must be either 'rope' or 'none'."
-            )
+            raise ValueError("TemporalAttentionCell position_embedding must be either 'rope' or 'none'.")
         if normalization not in {"rms_norm", "layer_norm"}:
-            raise ValueError(
-                "TemporalAttentionCell normalization must be either 'rms_norm' or 'layer_norm'."
-            )
+            raise ValueError("TemporalAttentionCell normalization must be either 'rms_norm' or 'layer_norm'.")
 
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -264,17 +274,17 @@ class TemporalAttentionCell(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim != 3:
-            raise ValueError(
-                f"TemporalAttentionCell expects [B, T, D], got shape {tuple(input.shape)}."
-            )
+            raise ValueError(f"TemporalAttentionCell expects [B, T, D], got shape {tuple(input.shape)}.")
         batch_size = input.shape[0]
         tokens = self.input_projection(input)
         tokens = torch.cat((tokens, self.readout_token.expand(batch_size, -1, -1)), dim=1)
 
         normalized = self.attention_norm(tokens)
-        query = self.query_projection(normalized[:, -1:]).reshape(
-            batch_size, 1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        query = (
+            self.query_projection(normalized[:, -1:])
+            .reshape(batch_size, 1, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         key_value = self.key_value_projection(normalized).reshape(
             batch_size, tokens.shape[1], 2, self.num_heads, self.head_dim
         )
@@ -336,6 +346,7 @@ class CommandSelfAttentionCell(nn.Module):
         attention_residual: bool = True,
         ffn_residual: bool = True,
         use_ffn: bool = True,
+        project_inputs: bool = True,
     ) -> None:
         super().__init__()
         if len(input_dim) != 2:
@@ -354,8 +365,10 @@ class CommandSelfAttentionCell(nn.Module):
         self.attention_residual = attention_residual
         self.ffn_residual = ffn_residual
         self.use_ffn = use_ffn
-        self.readout_projection = nn.Linear(input_dim[0], output_dim)
-        self.command_projection = nn.Linear(input_dim[1], output_dim)
+        if not project_inputs and any(dim != output_dim for dim in input_dim):
+            raise ValueError("CommandSelfAttentionCell inputs must match output_dim when project_inputs is disabled.")
+        self.readout_projection = nn.Linear(input_dim[0], output_dim) if project_inputs else nn.Identity()
+        self.command_projection = nn.Linear(input_dim[1], output_dim) if project_inputs else nn.Identity()
         norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
         self.attention_norm = norm_class(output_dim, eps=normalization_eps)
         self.query_projection = nn.Linear(output_dim, output_dim)
@@ -377,13 +390,9 @@ class CommandSelfAttentionCell(nn.Module):
     def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
         readout_input, command_input = input
         if readout_input.ndim != 2:
-            raise ValueError(
-                f"CommandSelfAttentionCell readout expects [B, D], got {tuple(readout_input.shape)}."
-            )
+            raise ValueError(f"CommandSelfAttentionCell readout expects [B, D], got {tuple(readout_input.shape)}.")
         if command_input.ndim != 3:
-            raise ValueError(
-                f"CommandSelfAttentionCell commands expect [B, N, D], got {tuple(command_input.shape)}."
-            )
+            raise ValueError(f"CommandSelfAttentionCell commands expect [B, N, D], got {tuple(command_input.shape)}.")
         if readout_input.shape[0] != command_input.shape[0]:
             raise ValueError("CommandSelfAttentionCell input batch sizes must match.")
 
@@ -391,9 +400,11 @@ class CommandSelfAttentionCell(nn.Module):
         readout = self.readout_projection(readout_input).unsqueeze(1)
         commands = self.command_projection(command_input)
         context = torch.cat((readout, commands), dim=1)
-        query = self.query_projection(self.attention_norm(commands)).reshape(
-            batch_size, num_commands, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        query = (
+            self.query_projection(self.attention_norm(commands))
+            .reshape(batch_size, num_commands, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         key_value = self.key_value_projection(self.attention_norm(context)).reshape(
             batch_size, num_commands + 1, 2, self.num_heads, self.head_dim
         )
@@ -468,22 +479,20 @@ class CrossAttentionCell(nn.Module):
     def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
         query_input, context_input = input
         if query_input.ndim != 2:
-            raise ValueError(
-                f"CrossAttentionCell query expects [B, D], got shape {tuple(query_input.shape)}."
-            )
+            raise ValueError(f"CrossAttentionCell query expects [B, D], got shape {tuple(query_input.shape)}.")
         if context_input.ndim != 3:
-            raise ValueError(
-                f"CrossAttentionCell context expects [B, N, D], got shape {tuple(context_input.shape)}."
-            )
+            raise ValueError(f"CrossAttentionCell context expects [B, N, D], got shape {tuple(context_input.shape)}.")
         if query_input.shape[0] != context_input.shape[0]:
             raise ValueError("CrossAttentionCell query and context batch sizes must match.")
 
         batch_size, num_tokens = context_input.shape[:2]
         query_token = self.query_input_projection(query_input).unsqueeze(1)
         context_tokens = self.context_input_projection(context_input)
-        query = self.query_projection(self.query_norm(query_token)).reshape(
-            batch_size, 1, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+        query = (
+            self.query_projection(self.query_norm(query_token))
+            .reshape(batch_size, 1, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         key_value = self.key_value_projection(self.context_norm(context_tokens)).reshape(
             batch_size, num_tokens, 2, self.num_heads, self.head_dim
         )
@@ -500,6 +509,391 @@ class CrossAttentionCell(nn.Module):
         ffn_output = self.ffn(self.ffn_norm(encoded))
         encoded = encoded + ffn_output if self.ffn_residual else ffn_output
         return encoded[:, 0]
+
+
+class TokenSelfAttentionCell(nn.Module):
+    """Apply self-attention to every token and return the complete sequence."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        position_embedding: str = "none",
+        normalization: str = "rms_norm",
+        normalization_eps: float = 1.0e-6,
+        attention_residual: bool = True,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        if output_dim % num_heads != 0:
+            raise ValueError("TokenSelfAttentionCell output_dim must be divisible by num_heads.")
+        self.head_dim = output_dim // num_heads
+        if position_embedding == "rope" and self.head_dim % 2 != 0:
+            raise ValueError("TokenSelfAttentionCell head dimension must be even for RoPE.")
+        if position_embedding not in {"rope", "none"}:
+            raise ValueError("TokenSelfAttentionCell position_embedding must be either 'rope' or 'none'.")
+        if normalization not in {"rms_norm", "layer_norm"}:
+            raise ValueError("TokenSelfAttentionCell normalization must be 'rms_norm' or 'layer_norm'.")
+        if input_dim != output_dim:
+            raise ValueError("TokenSelfAttentionCell input_dim must match output_dim for an identity residual.")
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.rope_base = rope_base
+        self.position_embedding = position_embedding
+        self.attention_residual = attention_residual
+        norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
+        self.attention_norm = norm_class(output_dim, eps=normalization_eps)
+        self.query_projection = nn.Linear(output_dim, output_dim)
+        self.key_value_projection = nn.Linear(output_dim, 2 * output_dim)
+        self.output_projection = nn.Linear(output_dim, output_dim)
+        self.attention_dropout = dropout
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if input.ndim != 3:
+            raise ValueError(f"TokenSelfAttentionCell expects [B, T, D], got shape {tuple(input.shape)}.")
+        return self._forward(input, readout_only=False)
+
+    def forward_readout(self, input: torch.Tensor) -> torch.Tensor:
+        """Update and return only the trailing readout query."""
+        if input.ndim != 3:
+            raise ValueError(f"TokenSelfAttentionCell expects [B, T, D], got shape {tuple(input.shape)}.")
+        return self._forward(input, readout_only=True)[:, 0]
+
+    def _forward(self, input: torch.Tensor, readout_only: bool) -> torch.Tensor:
+        batch_size, num_tokens = input.shape[:2]
+        tokens = input
+        normalized = self.attention_norm(tokens)
+        query_tokens = normalized[:, -1:] if readout_only else normalized
+        num_queries = query_tokens.shape[1]
+        query = (
+            self.query_projection(query_tokens)
+            .reshape(batch_size, num_queries, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        key_value = self.key_value_projection(normalized).reshape(
+            batch_size, num_tokens, 2, self.num_heads, self.head_dim
+        )
+        key, value = key_value.permute(2, 0, 3, 1, 4).unbind(0)
+        if self.position_embedding == "rope":
+            query = self._apply_rope(query, position_offset=num_tokens - 1 if readout_only else 0)
+            key = self._apply_rope(key)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch_size, num_queries, self.output_dim)
+        attended = self.output_projection(attended)
+        residual = tokens[:, -1:] if readout_only else tokens
+        return residual + attended if self.attention_residual else attended
+
+    def _apply_rope(self, tensor: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
+        sequence_length = tensor.shape[-2]
+        frequency = 1.0 / (
+            self.rope_base
+            ** (torch.arange(0, self.head_dim, 2, device=tensor.device, dtype=torch.float32) / self.head_dim)
+        )
+        position = torch.arange(
+            position_offset,
+            position_offset + sequence_length,
+            device=tensor.device,
+            dtype=torch.float32,
+        )
+        angles = torch.outer(position, frequency).to(dtype=tensor.dtype)
+        cosine = angles.cos()[None, None]
+        sine = angles.sin()[None, None]
+        even, odd = tensor[..., 0::2], tensor[..., 1::2]
+        return torch.stack((even * cosine - odd * sine, odd * cosine + even * sine), dim=-1).flatten(-2)
+
+
+class SwiGLU(nn.Module):
+    """A bias-free gated feed-forward network using a SiLU gate."""
+
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.gate = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.value = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.output = nn.Linear(hidden_dim, input_dim, bias=False)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return self.output(F.silu(self.gate(input)) * self.value(input))
+
+
+class TokenCrossAttentionCell(nn.Module):
+    """Cross-attend every query token to context tokens, then apply a token-wise FFN."""
+
+    def __init__(
+        self,
+        input_dim: tuple[int, int] | list[int],
+        output_dim: int,
+        num_heads: int = 4,
+        ffn_dim: int | None = None,
+        ffn_type: str = "swiglu",
+        activation: str = "gelu",
+        dropout: float = 0.0,
+        normalization: str = "rms_norm",
+        normalization_eps: float = 1.0e-6,
+        attention_residual: bool = True,
+        ffn_residual: bool = True,
+    ) -> None:
+        super().__init__()
+        if len(input_dim) != 2:
+            raise ValueError("TokenCrossAttentionCell requires query and key/value inputs.")
+        if output_dim % num_heads != 0:
+            raise ValueError("TokenCrossAttentionCell output_dim must be divisible by num_heads.")
+        if activation not in {"gelu", "relu", "silu"}:
+            raise ValueError(f"Unsupported TokenCrossAttentionCell activation '{activation}'.")
+        if normalization not in {"rms_norm", "layer_norm"}:
+            raise ValueError("TokenCrossAttentionCell normalization must be 'rms_norm' or 'layer_norm'.")
+        if ffn_type not in {"mlp", "swiglu"}:
+            raise ValueError("TokenCrossAttentionCell ffn_type must be 'mlp' or 'swiglu'.")
+        if any(dim != output_dim for dim in input_dim):
+            raise ValueError("TokenCrossAttentionCell inputs must match output_dim for an identity residual.")
+
+        self.input_dim = list(input_dim)
+        self.output_dim = output_dim
+        self.num_heads = num_heads
+        self.head_dim = output_dim // num_heads
+        self.attention_residual = attention_residual
+        self.ffn_residual = ffn_residual
+        norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
+        self.query_norm = norm_class(output_dim, eps=normalization_eps)
+        self.context_norm = norm_class(output_dim, eps=normalization_eps)
+        self.query_projection = nn.Linear(output_dim, output_dim)
+        self.key_value_projection = nn.Linear(output_dim, 2 * output_dim)
+        self.output_projection = nn.Linear(output_dim, output_dim)
+        self.attention_dropout = dropout
+        self.ffn_norm = norm_class(output_dim, eps=normalization_eps)
+        hidden_dim = ffn_dim or 4 * output_dim
+        if ffn_type == "swiglu":
+            self.ffn = SwiGLU(output_dim, hidden_dim)
+        else:
+            activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
+            self.ffn = nn.Sequential(
+                nn.Linear(output_dim, hidden_dim),
+                activation_layer(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+                nn.Dropout(dropout),
+            )
+
+    def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
+        query_input, context_input = input
+        if query_input.ndim != 3:
+            raise ValueError(f"TokenCrossAttentionCell query expects [B, T, D], got shape {tuple(query_input.shape)}.")
+        if context_input.ndim != 3:
+            raise ValueError(
+                f"TokenCrossAttentionCell context expects [B, N, D], got shape {tuple(context_input.shape)}."
+            )
+        if query_input.shape[0] != context_input.shape[0]:
+            raise ValueError("TokenCrossAttentionCell query and context batch sizes must match.")
+        return self._forward(query_input, context_input)
+
+    def forward_readout(self, readout: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Cross-attend and feed forward only one readout query."""
+        if readout.ndim != 2:
+            raise ValueError(f"TokenCrossAttentionCell readout expects [B, D], got shape {tuple(readout.shape)}.")
+        if context.ndim != 3:
+            raise ValueError(f"TokenCrossAttentionCell context expects [B, N, D], got shape {tuple(context.shape)}.")
+        if readout.shape[0] != context.shape[0]:
+            raise ValueError("TokenCrossAttentionCell readout and context batch sizes must match.")
+        return self._forward(readout.unsqueeze(1), context)[:, 0]
+
+    def _forward(self, query_input: torch.Tensor, context_input: torch.Tensor) -> torch.Tensor:
+        batch_size, num_queries = query_input.shape[:2]
+        num_context_tokens = context_input.shape[1]
+        query_tokens = query_input
+        context_tokens = context_input
+        query = (
+            self.query_projection(self.query_norm(query_tokens))
+            .reshape(batch_size, num_queries, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        key_value = self.key_value_projection(self.context_norm(context_tokens)).reshape(
+            batch_size, num_context_tokens, 2, self.num_heads, self.head_dim
+        )
+        key, value = key_value.permute(2, 0, 3, 1, 4).unbind(0)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch_size, num_queries, self.output_dim)
+        attended = self.output_projection(attended)
+        encoded = query_tokens + attended if self.attention_residual else attended
+        ffn_output = self.ffn(self.ffn_norm(encoded))
+        return encoded + ffn_output if self.ffn_residual else ffn_output
+
+
+class TrackingAttentionBlock(nn.Module):
+    """Update full temporal tokens using raw command tokens in three attention stages."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        num_heads: int = 4,
+        ffn_dim: int | None = None,
+        ffn_type: str = "swiglu",
+        activation: str = "gelu",
+        dropout: float = 0.0,
+        position_embedding: str = "rope",
+        normalization: str = "rms_norm",
+        normalization_eps: float = 1.0e-6,
+        attention_residual: bool = True,
+        ffn_residual: bool = True,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        self.temporal_self_attention = TokenSelfAttentionCell(
+            input_dim=feature_dim,
+            output_dim=feature_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            position_embedding=position_embedding,
+            normalization=normalization,
+            normalization_eps=normalization_eps,
+            attention_residual=attention_residual,
+            rope_base=rope_base,
+        )
+        self.command_self_attention = CommandSelfAttentionCell(
+            input_dim=[feature_dim, feature_dim],
+            output_dim=feature_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            normalization=normalization,
+            normalization_eps=normalization_eps,
+            attention_residual=attention_residual,
+            use_ffn=False,
+            project_inputs=False,
+        )
+        self.cross_attention = TokenCrossAttentionCell(
+            input_dim=[feature_dim, feature_dim],
+            output_dim=feature_dim,
+            num_heads=num_heads,
+            ffn_dim=ffn_dim,
+            ffn_type=ffn_type,
+            activation=activation,
+            dropout=dropout,
+            normalization=normalization,
+            normalization_eps=normalization_eps,
+            attention_residual=attention_residual,
+            ffn_residual=ffn_residual,
+        )
+
+    def forward(self, temporal_tokens: torch.Tensor, raw_command_tokens: torch.Tensor) -> torch.Tensor:
+        temporal_tokens = self.temporal_self_attention(temporal_tokens)
+        readout = temporal_tokens[:, -1]
+        command_tokens = self.command_self_attention([readout, raw_command_tokens])
+        return self.cross_attention([temporal_tokens, command_tokens])
+
+    def forward_readout(self, temporal_tokens: torch.Tensor, raw_command_tokens: torch.Tensor) -> torch.Tensor:
+        """Run the block while computing only outputs needed for the final readout."""
+        readout = self.temporal_self_attention.forward_readout(temporal_tokens)
+        command_tokens = self.command_self_attention([readout, raw_command_tokens])
+        return self.cross_attention.forward_readout(readout, command_tokens)
+
+
+class StackedTrackingAttentionCell(nn.Module):
+    """Stack tracking attention blocks and return the final temporal readout."""
+
+    def __init__(
+        self,
+        input_dim: tuple[int, int] | list[int],
+        output_dim: int,
+        num_blocks: int = 1,
+        num_heads: int = 4,
+        ffn_dim: int | None = None,
+        ffn_type: str = "swiglu",
+        activation: str = "gelu",
+        dropout: float = 0.0,
+        position_embedding: str = "rope",
+        normalization: str = "rms_norm",
+        normalization_eps: float = 1.0e-6,
+        attention_residual: bool = True,
+        ffn_residual: bool = True,
+        rope_base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        if len(input_dim) != 2:
+            raise ValueError("StackedTrackingAttentionCell requires temporal and raw command inputs.")
+        if any(dim != output_dim for dim in input_dim):
+            raise ValueError("StackedTrackingAttentionCell requires both input feature dimensions to equal output_dim.")
+        if num_blocks < 1:
+            raise ValueError("StackedTrackingAttentionCell num_blocks must be at least one.")
+
+        self.input_dim = list(input_dim)
+        self.output_dim = output_dim
+        self.num_blocks = num_blocks
+        self.residual_scale = 1.0 / math.sqrt(2.0 * num_blocks)
+        self.readout_token = nn.Parameter(torch.zeros(1, 1, output_dim))
+        self.blocks = nn.ModuleList([
+            TrackingAttentionBlock(
+                feature_dim=output_dim,
+                num_heads=num_heads,
+                ffn_dim=ffn_dim,
+                ffn_type=ffn_type,
+                activation=activation,
+                dropout=dropout,
+                position_embedding=position_embedding,
+                normalization=normalization,
+                normalization_eps=normalization_eps,
+                attention_residual=attention_residual,
+                ffn_residual=ffn_residual,
+                rope_base=rope_base,
+            )
+            for _ in range(num_blocks)
+        ])
+        norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
+        self.final_norm = norm_class(output_dim, eps=normalization_eps)
+        self._initialize_weights()
+        nn.init.normal_(self.readout_token, std=0.02)
+
+    def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
+        temporal_tokens, raw_command_tokens = input
+        if temporal_tokens.ndim != 3:
+            raise ValueError(
+                f"StackedTrackingAttentionCell temporal input expects [B, T, D], got {tuple(temporal_tokens.shape)}."
+            )
+        if raw_command_tokens.ndim != 3:
+            raise ValueError(
+                "StackedTrackingAttentionCell raw command input expects "
+                f"[B, N, D], got {tuple(raw_command_tokens.shape)}."
+            )
+        if temporal_tokens.shape[0] != raw_command_tokens.shape[0]:
+            raise ValueError("StackedTrackingAttentionCell input batch sizes must match.")
+
+        readout = self.readout_token.expand(temporal_tokens.shape[0], -1, -1)
+        temporal_tokens = torch.cat((temporal_tokens, readout), dim=1)
+        for block in self.blocks[:-1]:
+            temporal_tokens = block(temporal_tokens, raw_command_tokens)
+        readout = self.blocks[-1].forward_readout(temporal_tokens, raw_command_tokens)
+        return self.final_norm(readout)
+
+    @torch.no_grad()
+    def _initialize_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=1.0 / math.sqrt(module.in_features))
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, (nn.RMSNorm, nn.LayerNorm)):
+                nn.init.ones_(module.weight)
+                if getattr(module, "bias", None) is not None:
+                    nn.init.zeros_(module.bias)
+
+        for block in self.blocks:
+            block.temporal_self_attention.output_projection.weight.mul_(self.residual_scale)
+            block.command_self_attention.output_projection.weight.mul_(self.residual_scale)
+            block.cross_attention.output_projection.weight.mul_(self.residual_scale)
+            ffn = block.cross_attention.ffn
+            ffn_output = ffn.output if isinstance(ffn, SwiGLU) else ffn[3]
+            ffn_output.weight.mul_(self.residual_scale)
 
 
 class InterleavedCausalAttentionCell(nn.Module):
@@ -586,9 +980,12 @@ class InterleavedCausalAttentionCell(nn.Module):
         )
 
         normalized = self.attention_norm(tokens)
-        query, key, value = self.qkv_projection(normalized).reshape(
-            observations.shape[0], tokens.shape[1], 3, self.num_heads, self.head_dim
-        ).permute(2, 0, 3, 1, 4).unbind(0)
+        query, key, value = (
+            self.qkv_projection(normalized)
+            .reshape(observations.shape[0], tokens.shape[1], 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+            .unbind(0)
+        )
         if self.position_embedding == "rope":
             query = self._apply_rope(query)
             key = self._apply_rope(key)

@@ -1,3 +1,8 @@
+# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 from __future__ import annotations
 
 import copy
@@ -12,7 +17,9 @@ from rsl_rl.models.graph.cells import (
     CommandSelfAttentionCell,
     CrossAttentionCell,
     InterleavedCausalAttentionCell,
+    LinearCell,
     MLPCell,
+    StackedTrackingAttentionCell,
     TemporalAttentionCell,
     TokenAddCell,
     TokenMergeCell,
@@ -61,12 +68,10 @@ class ModelGraph(nn.Module):
         self._incoming, self._execution_order = self._compile_graph()
 
         self.obs_normalization = obs_normalization
-        self.input_normalizers = nn.ModuleDict(
-            {
-                name: EmpiricalNormalization(dim) if obs_normalization else nn.Identity()
-                for name, dim in self._input_dims.items()
-            }
-        )
+        self.input_normalizers = nn.ModuleDict({
+            name: EmpiricalNormalization(dim) if obs_normalization else nn.Identity()
+            for name, dim in self._input_dims.items()
+        })
 
         if distribution_cfg is not None:
             dist_cfg = distribution_cfg.copy()
@@ -188,9 +193,7 @@ class ModelGraph(nn.Module):
                 raise ValueError(f"Graph input observation group '{name}' is missing.")
             input_tensor = self._input_tensor(obs[name], name)
             if input_tensor.ndim not in (2, 3):
-                raise ValueError(
-                    f"Graph input '{name}' must be rank 2 or 3, got shape {tuple(input_tensor.shape)}."
-                )
+                raise ValueError(f"Graph input '{name}' must be rank 2 or 3, got shape {tuple(input_tensor.shape)}.")
             dims[name] = input_tensor.shape[-1]
         return dims
 
@@ -205,9 +208,7 @@ class ModelGraph(nn.Module):
                 tensor = value[keys[0]]
                 if isinstance(tensor, torch.Tensor):
                     return tensor
-        raise ValueError(
-            f"Graph input observation group '{name}' must be a tensor or contain exactly one tensor term."
-        )
+        raise ValueError(f"Graph input observation group '{name}' must be a tensor or contain exactly one tensor term.")
 
     def _compile_graph(self) -> tuple[dict[str, list[str]], list[str]]:
         incoming: dict[str, list[str]] = defaultdict(list)
@@ -251,6 +252,8 @@ class ModelGraph(nn.Module):
 
     @staticmethod
     def _resolve_cell(class_name: str):
+        if class_name == "LinearCell":
+            return LinearCell
         if class_name == "MLPCell":
             return MLPCell
         if class_name == "TokenProjectionCell":
@@ -271,4 +274,6 @@ class ModelGraph(nn.Module):
             return InterleavedCausalAttentionCell
         if class_name == "CrossAttentionCell":
             return CrossAttentionCell
+        if class_name == "StackedTrackingAttentionCell":
+            return StackedTrackingAttentionCell
         return resolve_callable(class_name)
