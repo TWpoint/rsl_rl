@@ -144,16 +144,14 @@ class PPO:
 
     def _adapt_learning_rate(self, kl_mean: torch.Tensor) -> None:
         """Adapt the actor learning rate from policy KL while leaving a split critic rate fixed."""
-        if self.gpu_global_rank == 0:
+        # In distributed training, ``kl_mean`` has already been averaged with an
+        # all-reduce, so every rank can deterministically apply the same update.
+        # This avoids a latency-bound scalar broadcast for every mini-batch.
+        if self.gpu_global_rank == 0 or self.is_multi_gpu:
             if kl_mean > self.desired_kl * 2.0:
                 self.actor_learning_rate = max(1e-5, self.actor_learning_rate / 1.5)
             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                 self.actor_learning_rate = min(1e-2, self.actor_learning_rate * 1.5)
-
-        if self.is_multi_gpu:
-            lr_tensor = torch.tensor(self.actor_learning_rate, device=self.device)
-            torch.distributed.broadcast(lr_tensor, src=0)
-            self.actor_learning_rate = lr_tensor.item()
 
         self.learning_rate = self.actor_learning_rate
         if self._separate_learning_rates:
