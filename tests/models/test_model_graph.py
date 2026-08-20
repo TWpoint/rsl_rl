@@ -8,7 +8,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.models import ModelGraph
-from rsl_rl.models.graph.cells import TrackingAttentionBlock, TokenMergeCell
+from rsl_rl.models.graph.cells import TopologyProjectionCell, TrackingAttentionBlock, TokenMergeCell
 from rsl_rl.models.mlp_model import MLPModel
 
 
@@ -273,6 +273,25 @@ def test_cross_attention_from_temporal_query_to_command_tokens():
     assert graph.nodes["temporal_encoder"].input_projection.weight.grad is not None
 
 
+def test_topology_projection_supports_an_optional_mlp() -> None:
+    cell = TopologyProjectionCell(
+        input_dim=81,
+        output_dim=256,
+        topology=[[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]] * 14,
+        hidden_dims=[64],
+        activation="gelu",
+    )
+    output = cell(torch.randn(3, 14, 81))
+    output.square().mean().backward()
+
+    assert output.shape == (3, 14, 256)
+    assert isinstance(cell.projection, torch.nn.Sequential)
+    assert cell.projection[0].weight.shape == (64, 9)
+    assert isinstance(cell.projection[1], torch.nn.GELU)
+    assert cell.projection[2].weight.shape == (256, 64)
+    assert cell.projection[0].weight.grad is not None
+
+
 def test_command_self_attention_updates_only_commands_before_cross_attention():
     obs = TensorDict({"readout": torch.randn(5, 32), "command": torch.randn(5, 14, 32)}, batch_size=[5])
     graph = ModelGraph(
@@ -435,6 +454,26 @@ def test_tracking_attention_blocks_preserve_tokens_and_stack():
     assert attention_stack.readout_token.grad is not None
     assert attention_stack.final_norm.weight.grad is not None
     assert all(block.cross_attention.ffn.output.weight.grad is not None for block in attention_stack.blocks)
+
+
+def test_tracking_attention_block_supports_beyondminic_gelu_ffns():
+    block = TrackingAttentionBlock(
+        feature_dim=32,
+        num_heads=4,
+        command_ffn_dim=64,
+        ffn_dim=64,
+        ffn_type="mlp",
+        activation="gelu",
+    )
+    temporal = torch.randn(2, 10, 32)
+    command = torch.randn(2, 14, 32)
+
+    output = block(temporal, command)
+
+    assert output.shape == temporal.shape
+    assert block.command_self_attention.use_ffn
+    assert isinstance(block.command_self_attention.ffn[1], torch.nn.GELU)
+    assert isinstance(block.cross_attention.ffn[1], torch.nn.GELU)
 
 
 def test_projected_observation_and_action_tokens_are_interleaved():

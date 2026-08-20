@@ -17,11 +17,15 @@ from rsl_rl.modules import MLP
 class LinearCell(nn.Module):
     """A rank-2 linear projection cell used by :class:`ModelGraph`."""
 
-    def __init__(self, input_dim: int, output_dim: int) -> None:
+    def __init__(self, input_dim: int, output_dim: int, zero_init_output: bool = False) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.linear = nn.Linear(input_dim, output_dim)
+        if zero_init_output:
+            nn.init.zeros_(self.linear.weight)
+            if self.linear.bias is not None:
+                nn.init.zeros_(self.linear.bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim != 2:
@@ -38,6 +42,7 @@ class MLPCell(nn.Module):
         output_dim: int,
         hidden_dims: tuple[int, ...] | list[int],
         activation: str = "elu",
+        zero_init_output: bool = False,
     ) -> None:
         super().__init__()
         if not hidden_dims:
@@ -45,6 +50,11 @@ class MLPCell(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.mlp = MLP(input_dim, output_dim, hidden_dims, activation)
+        if zero_init_output:
+            output_layer = next(module for module in reversed(self.mlp) if isinstance(module, nn.Linear))
+            nn.init.zeros_(output_layer.weight)
+            if output_layer.bias is not None:
+                nn.init.zeros_(output_layer.bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim != 2:
@@ -91,13 +101,15 @@ class TokenMLPCell(nn.Module):
 
 
 class TopologyProjectionCell(nn.Module):
-    """Project fixed entity topology coordinates into batched token features."""
+    """Project fixed entity topology descriptors into batched token features."""
 
     def __init__(
         self,
         input_dim: int,
         output_dim: int,
         topology: list[list[float]] | tuple[tuple[float, ...], ...],
+        hidden_dims: tuple[int, ...] | list[int] | None = None,
+        activation: str = "elu",
     ) -> None:
         super().__init__()
         coordinates = torch.as_tensor(topology, dtype=torch.float32)
@@ -106,7 +118,11 @@ class TopologyProjectionCell(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.register_buffer("topology", coordinates)
-        self.projection = nn.Linear(coordinates.shape[1], output_dim)
+        self.projection = (
+            MLP(coordinates.shape[1], output_dim, hidden_dims, activation)
+            if hidden_dims
+            else nn.Linear(coordinates.shape[1], output_dim)
+        )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.ndim != 3:
@@ -739,6 +755,7 @@ class TrackingAttentionBlock(nn.Module):
         feature_dim: int,
         num_heads: int = 4,
         ffn_dim: int | None = None,
+        command_ffn_dim: int | None = None,
         ffn_type: str = "swiglu",
         activation: str = "gelu",
         dropout: float = 0.0,
@@ -769,7 +786,10 @@ class TrackingAttentionBlock(nn.Module):
             normalization=normalization,
             normalization_eps=normalization_eps,
             attention_residual=attention_residual,
-            use_ffn=False,
+            ffn_dim=command_ffn_dim,
+            activation=activation,
+            ffn_residual=ffn_residual,
+            use_ffn=command_ffn_dim is not None,
             project_inputs=False,
         )
         self.cross_attention = TokenCrossAttentionCell(
@@ -809,6 +829,7 @@ class StackedTrackingAttentionCell(nn.Module):
         num_blocks: int = 1,
         num_heads: int = 4,
         ffn_dim: int | None = None,
+        command_ffn_dim: int | None = None,
         ffn_type: str = "swiglu",
         activation: str = "gelu",
         dropout: float = 0.0,
@@ -837,6 +858,7 @@ class StackedTrackingAttentionCell(nn.Module):
                 feature_dim=output_dim,
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
+                command_ffn_dim=command_ffn_dim,
                 ffn_type=ffn_type,
                 activation=activation,
                 dropout=dropout,
@@ -891,6 +913,8 @@ class StackedTrackingAttentionCell(nn.Module):
             block.temporal_self_attention.output_projection.weight.mul_(self.residual_scale)
             block.command_self_attention.output_projection.weight.mul_(self.residual_scale)
             block.cross_attention.output_projection.weight.mul_(self.residual_scale)
+            if block.command_self_attention.use_ffn:
+                block.command_self_attention.ffn[3].weight.mul_(self.residual_scale)
             ffn = block.cross_attention.ffn
             ffn_output = ffn.output if isinstance(ffn, SwiGLU) else ffn[3]
             ffn_output.weight.mul_(self.residual_scale)
