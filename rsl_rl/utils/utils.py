@@ -273,31 +273,32 @@ def resolve_obs_groups(
 
 
 def check_nan(obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor) -> None:
-    """Raise ``ValueError`` if any environment output contains NaN."""
+    """Raise ``ValueError`` if any environment output contains NaN or Inf."""
     # Keep all reductions on the device and synchronize with the host only once.
     # The previous implementation synchronized once for every observation group,
     # plus rewards and dones, on every environment step.
     entries = [(f"observation:{key}", tensor) for key, tensor in obs.items()]
     entries.extend([("rewards", rewards), ("dones", dones)])
-    nan_flags = torch.stack([torch.isnan(tensor).any() for _, tensor in entries])
-    if not nan_flags.any():
+    nonfinite_flags = torch.stack([(~torch.isfinite(tensor)).any() for _, tensor in entries])
+    if not nonfinite_flags.any():
         return
 
-    first_bad = int(torch.nonzero(nan_flags, as_tuple=False)[0, 0].item())
+    first_bad = int(torch.nonzero(nonfinite_flags, as_tuple=False)[0, 0].item())
     label = entries[first_bad][0]
     if label.startswith("observation:"):
         key = label.removeprefix("observation:")
         raise ValueError(
-            f"The observation group '{key}' returned by the environment contains NaN values. This usually indicates"
+            f"The observation group '{key}' returned by the environment contains non-finite values. This usually "
+            "indicates"
             " a bug in the environment's step() or reset() function."
         )
     if label == "rewards":
         raise ValueError(
-            "The rewards returned by the environment contain NaN values. This usually indicates a bug in the"
+            "The rewards returned by the environment contain non-finite values. This usually indicates a bug in the"
             " environment's reward computation."
         )
     raise ValueError(
-        "The dones returned by the environment contain NaN values. This usually indicates a bug in the"
+        "The dones returned by the environment contain non-finite values. This usually indicates a bug in the"
         " environment's termination logic."
     )
 
