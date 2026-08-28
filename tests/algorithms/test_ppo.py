@@ -197,6 +197,36 @@ class TestGAEComputation:
         assert abs(adv.mean().item()) < 1e-5, "Advantages should be zero-mean"
         assert abs(adv.std().item() - 1.0) < 0.1, "Advantages should be unit-std"
 
+    def test_advantage_normalization_uses_moments_from_all_ranks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Distributed normalization should use the combined advantage distribution."""
+        ppo, _ = _build_ppo(
+            normalize_advantage_per_mini_batch=False,
+            multi_gpu_cfg={"global_rank": 0, "world_size": 2},
+        )
+        local_advantages = torch.tensor([1.0, 3.0])
+        remote_advantages = torch.tensor([5.0, 7.0])
+
+        remote_moments = torch.tensor(
+            [
+                remote_advantages.double().sum(),
+                remote_advantages.double().square().sum(),
+                remote_advantages.numel(),
+            ],
+            dtype=torch.float64,
+        )
+
+        def fake_all_reduce(tensor: torch.Tensor, op: object) -> None:
+            assert op == torch.distributed.ReduceOp.SUM
+            tensor.add_(remote_moments)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+        normalized = ppo._normalize_advantages(local_advantages)
+        global_advantages = torch.cat((local_advantages, remote_advantages))
+        expected = (local_advantages - global_advantages.mean()) / (global_advantages.std() + 1e-8)
+
+        assert torch.allclose(normalized, expected)
+
 
 class TestTimeoutBootstrapping:
     """Tests for timeout bootstrapping in ``process_env_step``."""
@@ -250,75 +280,187 @@ class TestPPOLosses:
         expected_clipped = (-advantages * (1.0 + clip_param)).mean()
         assert torch.allclose(loss, expected_clipped, atol=1e-5)
 
-    def test_value_loss_clipping(self) -> None:
-        """With clipped value loss, large value changes should be clipped."""
-        clip_param = 0.2
+    def test_elementwise_value_loss_uses_worse_clipped_or_unclipped_error(self) -> None:
+        """Clipped value loss should retain the worse candidate for every element."""
+        ppo, _ = _build_ppo(clip_param=0.2, use_clipped_value_loss=True)
         old_values = torch.tensor([[1.0], [1.0]])
-        new_values = torch.tensor([[2.0], [1.1]])
-        returns = torch.tensor([[1.5], [1.5]])
+        new_values = torch.tensor([[2.0], [1.3]])
+        returns = torch.tensor([[1.5], [2.0]])
 
-        value_clipped = old_values + (new_values - old_values).clamp(-clip_param, clip_param)
-        losses_unclipped = (new_values - returns).pow(2)
-        losses_clipped = (value_clipped - returns).pow(2)
-        loss = torch.max(losses_unclipped, losses_clipped).mean()
+        effective_loss = ppo._compute_elementwise_value_loss(new_values, old_values, returns)
 
         # Env 0: new=2.0, old=1.0, clipped_new=1.2
         #   unclipped: (2.0 - 1.5)^2 = 0.25
         #   clipped: (1.2 - 1.5)^2 = 0.09
         #   max = 0.25
-        # Env 1: new=1.1, old=1.0, clipped_new=1.1 (within clip)
-        #   unclipped: (1.1 - 1.5)^2 = 0.16
-        #   clipped: (1.1 - 1.5)^2 = 0.16
-        #   max = 0.16
-        expected = (0.25 + 0.16) / 2
-        assert torch.allclose(loss, torch.tensor(expected), atol=1e-5)
+        # Env 1: new=1.3, old=1.0, clipped_new=1.2
+        #   unclipped: (1.3 - 2.0)^2 = 0.49
+        #   clipped: (1.2 - 2.0)^2 = 0.64
+        #   max = 0.64
+        expected = torch.tensor([[0.25], [0.64]])
+        assert torch.allclose(effective_loss, expected)
+        assert effective_loss.mean().item() == pytest.approx((0.25 + 0.64) / 2)
+
+    def test_elementwise_unclipped_value_loss_is_squared_error(self) -> None:
+        """Disabling clipping should return ordinary squared errors without reduction."""
+        ppo, _ = _build_ppo(use_clipped_value_loss=False)
+        old_values = torch.tensor([[100.0, -100.0], [4.0, 5.0]])
+        new_values = torch.tensor([[2.0, -1.0], [0.5, 4.0]])
+        returns = torch.tensor([[1.5, 1.0], [2.5, 3.0]])
+
+        effective_loss = ppo._compute_elementwise_value_loss(new_values, old_values, returns)
+
+        assert torch.equal(effective_loss, (new_values - returns).pow(2))
+        assert effective_loss.shape == new_values.shape
+
+    def test_default_value_loss_recording_hook_is_noop(self) -> None:
+        """Base PPO should not add logging state when no subclass opts into the hook."""
+        ppo, _ = _build_ppo()
+        effective_loss = torch.tensor([[0.25], [0.64]])
+
+        result = ppo._record_value_loss(effective_loss)
+
+        assert result is None
+
+    def test_update_mean_reduction_and_detached_recording_hook(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Base update should average all value elements and pass a detached tensor to the hook."""
+        ppo, obs = _build_ppo(num_learning_epochs=1, num_mini_batches=1)
+        for _ in range(NUM_STEPS):
+            ppo.act(obs)
+            ppo.process_env_step(obs, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS), {})
+        ppo.compute_returns(obs)
+
+        recorded_losses: list[torch.Tensor] = []
+
+        def fake_elementwise_loss(
+            values: torch.Tensor,
+            old_values: torch.Tensor,
+            returns: torch.Tensor,
+        ) -> torch.Tensor:
+            assert values.shape == old_values.shape == returns.shape
+            return values * 0.0 + 3.25
+
+        def record_value_loss(effective_value_loss: torch.Tensor) -> None:
+            recorded_losses.append(effective_value_loss)
+
+        monkeypatch.setattr(ppo, "_compute_elementwise_value_loss", fake_elementwise_loss)
+        monkeypatch.setattr(ppo, "_record_value_loss", record_value_loss)
+
+        losses = ppo.update()
+
+        assert losses["value"] == pytest.approx(3.25)
+        assert len(recorded_losses) == 1
+        assert torch.equal(recorded_losses[0], torch.full_like(recorded_losses[0], 3.25))
+        assert not recorded_losses[0].requires_grad
+        assert recorded_losses[0].grad_fn is None
+
+
+class TestGradientClipping:
+    """Tests for joint actor and critic gradient clipping."""
+
+    def test_actor_and_critic_use_one_joint_global_norm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """All PPO parameters should be passed to one clip_grad_norm_ call."""
+        ppo, _ = _build_ppo(max_grad_norm=0.1)
+        calls: list[tuple[list[torch.nn.Parameter], float]] = []
+
+        def fake_clip_grad_norm(parameters: object, max_norm: float) -> torch.Tensor:
+            calls.append((list(parameters), max_norm))  # type: ignore[arg-type]
+            return torch.tensor(0.2)
+
+        monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", fake_clip_grad_norm)
+
+        total_norm = ppo._clip_gradients()
+
+        expected_parameters = list(ppo.actor.parameters()) + list(ppo.critic.parameters())
+        assert len(calls) == 1
+        assert [id(parameter) for parameter in calls[0][0]] == [id(parameter) for parameter in expected_parameters]
+        assert calls[0][1] == 0.1
+        assert total_norm.item() == pytest.approx(0.2)
 
 
 class TestAdaptiveLearningRate:
     """Tests for adaptive KL-based learning rate scheduling."""
+
+    def test_default_lr_bounds_match_legacy_values(self) -> None:
+        """Default bounds should preserve the previous hard-coded scheduler range."""
+        ppo, _obs = _build_ppo()
+
+        assert ppo.learning_rate_min == 1e-5
+        assert ppo.learning_rate_max == 1e-2
 
     def test_lr_decreases_when_kl_too_high(self) -> None:
         """LR should decrease when KL > 2 * desired_kl."""
         ppo, _obs = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
         initial_lr = ppo.learning_rate
 
-        # Simulate high KL scenario
-        ppo.learning_rate = initial_lr
-        kl_mean = torch.tensor(0.03)  # > 2 * 0.01
-
-        # Apply the same logic as PPO.update
-        if kl_mean > ppo.desired_kl * 2.0:
-            ppo.learning_rate = max(1e-5, ppo.learning_rate / 1.5)
+        ppo._adapt_learning_rate(torch.tensor(0.03))  # > 2 * 0.01
 
         assert ppo.learning_rate < initial_lr
         assert ppo.learning_rate == max(1e-5, initial_lr / 1.5)
+        assert ppo.optimizer.param_groups[0]["lr"] == ppo.learning_rate
 
     def test_lr_increases_when_kl_too_low(self) -> None:
         """LR should increase when 0 < KL < desired_kl / 2."""
         ppo, _obs = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
         initial_lr = ppo.learning_rate
 
-        kl_mean = torch.tensor(0.002)  # < 0.01 / 2 = 0.005
-
-        if kl_mean < ppo.desired_kl / 2.0 and kl_mean > 0.0:
-            ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
+        ppo._adapt_learning_rate(torch.tensor(0.002))  # < 0.01 / 2 = 0.005
 
         assert ppo.learning_rate > initial_lr
         assert ppo.learning_rate == min(1e-2, initial_lr * 1.5)
+        assert ppo.optimizer.param_groups[0]["lr"] == ppo.learning_rate
 
     def test_lr_unchanged_in_stable_range(self) -> None:
         """LR should remain unchanged when KL is in [desired_kl/2, 2*desired_kl]."""
         ppo, _obs = _build_ppo(schedule="adaptive", desired_kl=0.01, learning_rate=1e-3)
         initial_lr = ppo.learning_rate
 
-        kl_mean = torch.tensor(0.01)  # Exactly desired_kl — in stable range
-
-        if kl_mean > ppo.desired_kl * 2.0:
-            ppo.learning_rate = max(1e-5, ppo.learning_rate / 1.5)
-        elif kl_mean < ppo.desired_kl / 2.0 and kl_mean > 0.0:
-            ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
+        ppo._adapt_learning_rate(torch.tensor(0.01))  # Exactly desired_kl — in stable range
 
         assert ppo.learning_rate == initial_lr
+
+    @pytest.mark.parametrize(
+        ("learning_rate", "kl_mean", "expected_learning_rate"),
+        [
+            (2.5e-4, 0.03, 2e-4),
+            (7e-4, 0.002, 8e-4),
+        ],
+    )
+    def test_custom_lr_bounds_are_enforced(
+        self, learning_rate: float, kl_mean: float, expected_learning_rate: float
+    ) -> None:
+        """Adaptive scheduling should clamp the actor rate to configured bounds."""
+        ppo, _obs = _build_ppo(
+            schedule="adaptive",
+            desired_kl=0.01,
+            learning_rate=learning_rate,
+            learning_rate_min=2e-4,
+            learning_rate_max=8e-4,
+        )
+
+        ppo._adapt_learning_rate(torch.tensor(kl_mean))
+
+        assert ppo.learning_rate == expected_learning_rate
+        assert ppo.actor_learning_rate == expected_learning_rate
+        assert ppo.critic_learning_rate == expected_learning_rate
+        assert ppo.optimizer.param_groups[0]["lr"] == expected_learning_rate
+
+    @pytest.mark.parametrize(
+        ("learning_rate_min", "learning_rate_max", "match"),
+        [
+            (0.0, 1e-2, "learning_rate_min must be positive"),
+            (-1e-5, 1e-2, "learning_rate_min must be positive"),
+            (1e-5, 0.0, "learning_rate_max must be positive"),
+            (1e-5, -1e-2, "learning_rate_max must be positive"),
+            (1e-2, 1e-5, "learning_rate_min must be less than or equal"),
+        ],
+    )
+    def test_invalid_lr_bounds_raise_value_error(
+        self, learning_rate_min: float, learning_rate_max: float, match: str
+    ) -> None:
+        """Adaptive learning-rate bounds must be positive and ordered."""
+        with pytest.raises(ValueError, match=match):
+            _build_ppo(learning_rate_min=learning_rate_min, learning_rate_max=learning_rate_max)
 
 
 class TestSeparateLearningRates:
@@ -357,6 +499,39 @@ class TestSeparateLearningRates:
         assert ppo.learning_rate == ppo.actor_learning_rate
         assert ppo.optimizer.param_groups[0]["lr"] == ppo.actor_learning_rate
         assert ppo.optimizer.param_groups[1]["lr"] == 5e-4
+
+    def test_shared_adaptation_applies_common_rate_to_all_groups(self) -> None:
+        ppo, _obs = _build_ppo(
+            schedule="adaptive",
+            desired_kl=0.01,
+            actor_learning_rate=2e-5,
+            critic_learning_rate=1e-3,
+            shared_kl_adaptation=True,
+        )
+
+        ppo._adapt_learning_rate(torch.tensor(0.01))
+
+        assert ppo.learning_rate == 2e-5
+        assert ppo.actor_learning_rate == 2e-5
+        assert ppo.critic_learning_rate == 2e-5
+        assert [group["lr"] for group in ppo.optimizer.param_groups] == [2e-5, 2e-5]
+
+    def test_shared_kl_matches_stabilized_reference_expression(self) -> None:
+        ppo, _obs = _build_ppo(shared_kl_adaptation=True)
+        old_mean = torch.tensor([[0.2, -0.1]])
+        old_std = torch.tensor([[0.05, 0.1]])
+        new_mean = torch.tensor([[0.3, -0.2]])
+        new_std = torch.tensor([[0.08, 0.12]])
+
+        actual = ppo._compute_adaptive_kl((old_mean, old_std), (new_mean, new_std))
+        expected = torch.sum(
+            torch.log(new_std / old_std + 1.0e-5)
+            + (old_std.square() + (old_mean - new_mean).square()) / (2.0 * new_std.square())
+            - 0.5,
+            dim=-1,
+        )
+
+        assert torch.equal(actual, expected)
 
     def test_unspecified_side_falls_back_to_legacy_rate(self) -> None:
         ppo, _obs = _build_ppo(learning_rate=1e-3, actor_learning_rate=5e-5)

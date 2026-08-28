@@ -60,8 +60,22 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # Adaptive learning rate parameters
+        learning_rate_min: float = 1e-5,
+        learning_rate_max: float = 1e-2,
+        shared_kl_adaptation: bool = False,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
+        if not learning_rate_min > 0.0:
+            raise ValueError(f"learning_rate_min must be positive, got {learning_rate_min}.")
+        if not learning_rate_max > 0.0:
+            raise ValueError(f"learning_rate_max must be positive, got {learning_rate_max}.")
+        if learning_rate_min > learning_rate_max:
+            raise ValueError(
+                "learning_rate_min must be less than or equal to learning_rate_max, "
+                f"got {learning_rate_min} > {learning_rate_max}."
+            )
+
         # Device-related parameters
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
@@ -138,28 +152,117 @@ class PPO:
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
         self.schedule = schedule
+        self.learning_rate_min = learning_rate_min
+        self.learning_rate_max = learning_rate_max
+        self.shared_kl_adaptation = shared_kl_adaptation
         # Backward-compatible alias used by the runner and existing loggers.
         self.learning_rate = self.actor_learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def _adapt_learning_rate(self, kl_mean: torch.Tensor) -> None:
-        """Adapt the actor learning rate from policy KL while leaving a split critic rate fixed."""
+        """Adapt the learning rate from policy KL."""
         # In distributed training, ``kl_mean`` has already been averaged with an
         # all-reduce, so every rank can deterministically apply the same update.
         # This avoids a latency-bound scalar broadcast for every mini-batch.
         if self.gpu_global_rank == 0 or self.is_multi_gpu:
             if kl_mean > self.desired_kl * 2.0:
-                self.actor_learning_rate = max(1e-5, self.actor_learning_rate / 1.5)
+                self.actor_learning_rate = max(self.learning_rate_min, self.actor_learning_rate / 1.5)
             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                self.actor_learning_rate = min(1e-2, self.actor_learning_rate * 1.5)
+                self.actor_learning_rate = min(self.learning_rate_max, self.actor_learning_rate * 1.5)
 
         self.learning_rate = self.actor_learning_rate
-        if self._separate_learning_rates:
+        if self.shared_kl_adaptation:
+            # Use one adaptive rate for the complete policy/value model. Every
+            # optimizer group receives the actor-derived rate before the step.
+            self.critic_learning_rate = self.actor_learning_rate
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.actor_learning_rate
+        elif self._separate_learning_rates:
             self.optimizer.param_groups[0]["lr"] = self.actor_learning_rate
         else:
             self.critic_learning_rate = self.actor_learning_rate
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.actor_learning_rate
+
+    def _compute_adaptive_kl(
+        self,
+        old_params: tuple[torch.Tensor, ...],
+        new_params: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        """Compute the policy KL used by the adaptive learning-rate schedule."""
+        if not self.shared_kl_adaptation:
+            return self.actor.get_kl_divergence(old_params, new_params)  # type: ignore
+
+        # Use the stabilized diagonal-Gaussian expression, including the epsilon
+        # inside log(new_std / old_std + 1e-5).
+        old_mean, old_std = old_params
+        new_mean, new_std = new_params
+        return torch.sum(
+            torch.log(new_std / old_std + 1.0e-5)
+            + (old_std.square() + (old_mean - new_mean).square()) / (2.0 * new_std.square())
+            - 0.5,
+            dim=-1,
+        )
+
+    def _normalize_advantages(self, advantages: torch.Tensor) -> torch.Tensor:
+        """Normalize advantages using moments from all ranks in distributed training."""
+        if not self.is_multi_gpu:
+            return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Reduce only three scalar moments instead of gathering the full rollout.
+        # Float64 keeps the variance calculation stable for large rollout batches.
+        advantages_double = advantages.double()
+        moments = torch.stack((
+            advantages_double.sum(),
+            advantages_double.square().sum(),
+            advantages_double.new_tensor(advantages.numel()),
+        ))
+        torch.distributed.all_reduce(moments, op=torch.distributed.ReduceOp.SUM)
+
+        total_sum, total_square_sum, total_count = moments.unbind()
+        mean = total_sum / total_count
+        # Match torch.std's default sample standard deviation (correction=1).
+        variance = (total_square_sum - total_sum.square() / total_count) / (total_count - 1.0).clamp_min(1.0)
+        std = variance.clamp_min(0.0).sqrt()
+        return (advantages - mean.to(advantages.dtype)) / (std.to(advantages.dtype) + 1e-8)
+
+    def _normalize_mini_batch_advantages(self, advantages: torch.Tensor) -> torch.Tensor:
+        """Normalize scalar advantages within one mini-batch."""
+        return (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    def _compute_surrogate_loss(self, advantages: torch.Tensor, ratio: torch.Tensor) -> torch.Tensor:
+        """Compute the scalar-objective clipped PPO surrogate loss."""
+        advantages = advantages.squeeze(-1)
+        surrogate = -advantages * ratio
+        surrogate_clipped = -advantages * torch.clamp(
+            ratio,
+            1.0 - self.clip_param,
+            1.0 + self.clip_param,
+        )
+        return torch.max(surrogate, surrogate_clipped).mean()
+
+    def _compute_elementwise_value_loss(
+        self,
+        values: torch.Tensor,
+        old_values: torch.Tensor,
+        returns: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the effective value loss without reducing sample or output dimensions."""
+        value_losses = (values - returns).pow(2)
+        if not self.use_clipped_value_loss:
+            return value_losses
+
+        value_clipped = old_values + (values - old_values).clamp(-self.clip_param, self.clip_param)
+        value_losses_clipped = (value_clipped - returns).pow(2)
+        return torch.maximum(value_losses, value_losses_clipped)
+
+    def _record_value_loss(self, effective_value_loss: torch.Tensor) -> None:
+        """Record optional diagnostics from a detached elementwise value loss tensor."""
+
+    def _clip_gradients(self) -> torch.Tensor:
+        """Clip actor and critic gradients using one joint global norm."""
+        parameters = chain(self.actor.parameters(), self.critic.parameters())
+        return nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -234,7 +337,7 @@ class PPO:
         st.advantages = st.returns - st.values
         # Normalize the advantages if per minibatch normalization is not used
         if not self.normalize_advantage_per_mini_batch:
-            st.advantages = (st.advantages - st.advantages.mean()) / (st.advantages.std() + 1e-8)
+            st.advantages = self._normalize_advantages(st.advantages)
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
@@ -259,7 +362,7 @@ class PPO:
             # Check if we should normalize advantages per mini-batch
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)  # type: ignore
+                    batch.advantages = self._normalize_mini_batch_advantages(batch.advantages)  # type: ignore
 
             # Perform symmetric augmentation if enabled
             if self.symmetry:
@@ -282,7 +385,7 @@ class PPO:
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
-                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
+                    kl = self._compute_adaptive_kl(batch.old_distribution_params, distribution_params)  # type: ignore
                     kl_mean = torch.mean(kl)
 
                     # Reduce the KL divergence across all GPUs
@@ -294,20 +397,12 @@ class PPO:
 
             # Surrogate loss
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-            surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-            surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_loss = self._compute_surrogate_loss(batch.advantages, ratio)  # type: ignore
 
             # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-                value_losses = (values - batch.returns).pow(2)
-                value_losses_clipped = (value_clipped - batch.returns).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (batch.returns - values).pow(2).mean()
+            effective_value_loss = self._compute_elementwise_value_loss(values, batch.values, batch.returns)  # type: ignore
+            value_loss = effective_value_loss.mean()
+            self._record_value_loss(effective_value_loss.detach())
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
@@ -333,8 +428,7 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            self._clip_gradients()
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd:
@@ -422,6 +516,15 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            if self.shared_kl_adaptation:
+                # Resume the saved common LR and apply it to every optimizer
+                # group. Our first group is the actor/common group.
+                resumed_learning_rate = self.optimizer.param_groups[0]["lr"]
+                self.actor_learning_rate = resumed_learning_rate
+                self.critic_learning_rate = resumed_learning_rate
+                self.learning_rate = resumed_learning_rate
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = resumed_learning_rate
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
