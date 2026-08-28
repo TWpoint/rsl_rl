@@ -100,6 +100,29 @@ class TestMiniBatchGenerator:
 
         assert batch_count == num_mini_batches * num_epochs
 
+    def test_each_epoch_is_shuffled_independently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Each epoch should generate a fresh permutation of the rollout samples."""
+        storage, obs = _make_storage_and_obs()
+        _fill_with_identifiable_data(storage, obs)
+        batch_size = NUM_ENVS * NUM_STEPS
+        permutations = [torch.arange(batch_size), torch.arange(batch_size - 1, -1, -1)]
+        call_count = 0
+
+        def fake_randperm(size: int, **kwargs: object) -> torch.Tensor:
+            nonlocal call_count
+            assert size == batch_size
+            permutation = permutations[call_count]
+            call_count += 1
+            return permutation.to(device=kwargs["device"])
+
+        monkeypatch.setattr(torch, "randperm", fake_randperm)
+
+        epoch_batches = list(storage.mini_batch_generator(num_mini_batches=1, num_epochs=2))
+
+        assert call_count == 2
+        assert torch.equal(epoch_batches[0].actions, storage.actions.flatten(0, 1))
+        assert torch.equal(epoch_batches[1].actions, storage.actions.flatten(0, 1).flip(0))
+
     def test_batch_fields_are_consistent(self) -> None:
         """All fields within a batch should index the same transitions."""
         storage, obs = _make_storage_and_obs()

@@ -228,7 +228,6 @@ class RolloutStorage:
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
-        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
         # Flatten the data
         observations = self.observations.flatten(0, 1)
@@ -239,7 +238,8 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
 
-        for epoch in range(num_epochs):
+        for _ in range(num_epochs):
+            indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
                 start = i * mini_batch_size
