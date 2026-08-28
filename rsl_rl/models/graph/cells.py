@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -355,6 +354,7 @@ class CommandSelfAttentionCell(nn.Module):
         output_dim: int,
         num_heads: int = 4,
         ffn_dim: int | None = None,
+        ffn_type: str = "mlp",
         activation: str = "gelu",
         dropout: float = 0.0,
         normalization: str = "rms_norm",
@@ -371,6 +371,8 @@ class CommandSelfAttentionCell(nn.Module):
             raise ValueError("CommandSelfAttentionCell output_dim must be divisible by num_heads.")
         if activation not in {"gelu", "relu", "silu"}:
             raise ValueError(f"Unsupported CommandSelfAttentionCell activation '{activation}'.")
+        if ffn_type not in {"mlp", "swiglu"}:
+            raise ValueError("CommandSelfAttentionCell ffn_type must be 'mlp' or 'swiglu'.")
         if normalization not in {"rms_norm", "layer_norm"}:
             raise ValueError("CommandSelfAttentionCell normalization must be 'rms_norm' or 'layer_norm'.")
 
@@ -394,14 +396,17 @@ class CommandSelfAttentionCell(nn.Module):
         if use_ffn:
             self.ffn_norm = norm_class(output_dim, eps=normalization_eps)
             hidden_dim = ffn_dim or 4 * output_dim
-            activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
-            self.ffn = nn.Sequential(
-                nn.Linear(output_dim, hidden_dim),
-                activation_layer(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, output_dim),
-                nn.Dropout(dropout),
-            )
+            if ffn_type == "swiglu":
+                self.ffn = SwiGLU(output_dim, hidden_dim)
+            else:
+                activation_layer = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}[activation]
+                self.ffn = nn.Sequential(
+                    nn.Linear(output_dim, hidden_dim),
+                    activation_layer(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, output_dim),
+                    nn.Dropout(dropout),
+                )
 
     def forward(self, input: list[torch.Tensor]) -> torch.Tensor:
         readout_input, command_input = input
@@ -528,7 +533,7 @@ class CrossAttentionCell(nn.Module):
 
 
 class TokenSelfAttentionCell(nn.Module):
-    """Apply self-attention to every token and return the complete sequence."""
+    """Apply optional causal self-attention and return the complete sequence."""
 
     def __init__(
         self,
@@ -541,6 +546,7 @@ class TokenSelfAttentionCell(nn.Module):
         normalization_eps: float = 1.0e-6,
         attention_residual: bool = True,
         rope_base: float = 10000.0,
+        causal: bool = False,
     ) -> None:
         super().__init__()
         if output_dim % num_heads != 0:
@@ -561,6 +567,7 @@ class TokenSelfAttentionCell(nn.Module):
         self.rope_base = rope_base
         self.position_embedding = position_embedding
         self.attention_residual = attention_residual
+        self.causal = causal
         norm_class = nn.RMSNorm if normalization == "rms_norm" else nn.LayerNorm
         self.attention_norm = norm_class(output_dim, eps=normalization_eps)
         self.query_projection = nn.Linear(output_dim, output_dim)
@@ -602,6 +609,9 @@ class TokenSelfAttentionCell(nn.Module):
             key,
             value,
             dropout_p=self.attention_dropout if self.training else 0.0,
+            # A readout-only query represents the final sequence position and
+            # may therefore attend every key under a causal mask.
+            is_causal=self.causal and not readout_only,
         )
         attended = attended.transpose(1, 2).reshape(batch_size, num_queries, self.output_dim)
         attended = self.output_projection(attended)
@@ -756,6 +766,7 @@ class TrackingAttentionBlock(nn.Module):
         num_heads: int = 4,
         ffn_dim: int | None = None,
         command_ffn_dim: int | None = None,
+        command_ffn_type: str = "mlp",
         ffn_type: str = "swiglu",
         activation: str = "gelu",
         dropout: float = 0.0,
@@ -765,6 +776,7 @@ class TrackingAttentionBlock(nn.Module):
         attention_residual: bool = True,
         ffn_residual: bool = True,
         rope_base: float = 10000.0,
+        causal: bool = False,
     ) -> None:
         super().__init__()
         self.temporal_self_attention = TokenSelfAttentionCell(
@@ -777,6 +789,7 @@ class TrackingAttentionBlock(nn.Module):
             normalization_eps=normalization_eps,
             attention_residual=attention_residual,
             rope_base=rope_base,
+            causal=causal,
         )
         self.command_self_attention = CommandSelfAttentionCell(
             input_dim=[feature_dim, feature_dim],
@@ -787,6 +800,7 @@ class TrackingAttentionBlock(nn.Module):
             normalization_eps=normalization_eps,
             attention_residual=attention_residual,
             ffn_dim=command_ffn_dim,
+            ffn_type=command_ffn_type,
             activation=activation,
             ffn_residual=ffn_residual,
             use_ffn=command_ffn_dim is not None,
@@ -830,6 +844,7 @@ class StackedTrackingAttentionCell(nn.Module):
         num_heads: int = 4,
         ffn_dim: int | None = None,
         command_ffn_dim: int | None = None,
+        command_ffn_type: str = "mlp",
         ffn_type: str = "swiglu",
         activation: str = "gelu",
         dropout: float = 0.0,
@@ -839,6 +854,7 @@ class StackedTrackingAttentionCell(nn.Module):
         attention_residual: bool = True,
         ffn_residual: bool = True,
         rope_base: float = 10000.0,
+        causal: bool = False,
     ) -> None:
         super().__init__()
         if len(input_dim) != 2:
@@ -859,6 +875,7 @@ class StackedTrackingAttentionCell(nn.Module):
                 num_heads=num_heads,
                 ffn_dim=ffn_dim,
                 command_ffn_dim=command_ffn_dim,
+                command_ffn_type=command_ffn_type,
                 ffn_type=ffn_type,
                 activation=activation,
                 dropout=dropout,
@@ -868,6 +885,7 @@ class StackedTrackingAttentionCell(nn.Module):
                 attention_residual=attention_residual,
                 ffn_residual=ffn_residual,
                 rope_base=rope_base,
+                causal=causal,
             )
             for _ in range(num_blocks)
         ])
@@ -914,7 +932,9 @@ class StackedTrackingAttentionCell(nn.Module):
             block.command_self_attention.output_projection.weight.mul_(self.residual_scale)
             block.cross_attention.output_projection.weight.mul_(self.residual_scale)
             if block.command_self_attention.use_ffn:
-                block.command_self_attention.ffn[3].weight.mul_(self.residual_scale)
+                command_ffn = block.command_self_attention.ffn
+                command_ffn_output = command_ffn.output if isinstance(command_ffn, SwiGLU) else command_ffn[3]
+                command_ffn_output.weight.mul_(self.residual_scale)
             ffn = block.cross_attention.ffn
             ffn_output = ffn.output if isinstance(ffn, SwiGLU) else ffn[3]
             ffn_output.weight.mul_(self.residual_scale)

@@ -3,12 +3,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import pytest
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.models import ModelGraph
-from rsl_rl.models.graph.cells import TopologyProjectionCell, TrackingAttentionBlock, TokenMergeCell
+from rsl_rl.models.graph.cells import (
+    TokenMergeCell,
+    TokenSelfAttentionCell,
+    TopologyProjectionCell,
+    TrackingAttentionBlock,
+)
 from rsl_rl.models.mlp_model import MLPModel
 
 
@@ -425,6 +431,8 @@ def test_tracking_attention_blocks_preserve_tokens_and_stack():
                     "num_blocks": 3,
                     "num_heads": 4,
                     "ffn_dim": 64,
+                    "command_ffn_dim": 64,
+                    "command_ffn_type": "swiglu",
                 }
             },
             "decoder": {"cell": {"class_name": "MLPCell", "hidden_dims": [16]}},
@@ -453,7 +461,23 @@ def test_tracking_attention_blocks_preserve_tokens_and_stack():
     assert attention_stack.residual_scale == pytest.approx(1.0 / (6.0**0.5))
     assert attention_stack.readout_token.grad is not None
     assert attention_stack.final_norm.weight.grad is not None
+    assert all(block.command_self_attention.ffn.output.weight.grad is not None for block in attention_stack.blocks)
     assert all(block.cross_attention.ffn.output.weight.grad is not None for block in attention_stack.blocks)
+
+
+def test_causal_token_self_attention_blocks_future_tokens_and_preserves_readout_fast_path() -> None:
+    """Causal attention blocks future dependencies while preserving the last-query shortcut."""
+    torch.manual_seed(0)
+    attention = TokenSelfAttentionCell(input_dim=32, output_dim=32, num_heads=4, causal=True)
+    tokens = torch.randn(2, 6, 32)
+    changed_future = tokens.clone()
+    changed_future[:, 4:] += 10.0 * torch.randn_like(changed_future[:, 4:])
+
+    output = attention(tokens)
+    changed_output = attention(changed_future)
+
+    torch.testing.assert_close(output[:, :4], changed_output[:, :4])
+    torch.testing.assert_close(attention.forward_readout(tokens), output[:, -1])
 
 
 def test_tracking_attention_block_supports_beyondminic_gelu_ffns():
@@ -474,6 +498,35 @@ def test_tracking_attention_block_supports_beyondminic_gelu_ffns():
     assert block.command_self_attention.use_ffn
     assert isinstance(block.command_self_attention.ffn[1], torch.nn.GELU)
     assert isinstance(block.cross_attention.ffn[1], torch.nn.GELU)
+
+
+def test_tracking_attention_block_keeps_command_mlp_as_the_default():
+    block = TrackingAttentionBlock(feature_dim=32, num_heads=4, command_ffn_dim=64, ffn_dim=64)
+
+    assert isinstance(block.command_self_attention.ffn, torch.nn.Sequential)
+    assert block.cross_attention.ffn.__class__.__name__ == "SwiGLU"
+
+
+def test_tracking_attention_block_supports_swiglu_ffns():
+    block = TrackingAttentionBlock(
+        feature_dim=32,
+        num_heads=4,
+        command_ffn_dim=48,
+        command_ffn_type="swiglu",
+        ffn_dim=48,
+        ffn_type="swiglu",
+    )
+
+    output = block(torch.randn(2, 10, 32), torch.randn(2, 14, 32))
+    output.square().mean().backward()
+
+    assert output.shape == (2, 10, 32)
+    assert block.command_self_attention.ffn.__class__.__name__ == "SwiGLU"
+    assert block.command_self_attention.ffn.gate.weight.shape == (48, 32)
+    assert block.command_self_attention.ffn.output.weight.grad is not None
+    assert block.cross_attention.ffn.__class__.__name__ == "SwiGLU"
+    assert block.cross_attention.ffn.gate.weight.shape == (48, 32)
+    assert block.cross_attention.ffn.output.weight.grad is not None
 
 
 def test_projected_observation_and_action_tokens_are_interleaved():
