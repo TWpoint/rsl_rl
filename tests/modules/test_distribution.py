@@ -122,6 +122,30 @@ class TestGaussianDistribution:
         dist_low.update(torch.zeros(1, dim))
         assert torch.allclose(dist_low.std, torch.full((1, dim), std_range[0]), atol=1e-6)
 
+    def test_scalar_std_projection_preserves_inward_gradient_at_upper_bound(self) -> None:
+        """An out-of-range scalar std should be projected without being gradient-locked."""
+        dist = GaussianDistribution(output_dim=2, init_std=1.0, std_type="scalar", std_range=(0.1, 0.5))
+        with torch.no_grad():
+            dist.std_param.fill_(0.6)
+
+        dist.update(torch.zeros(1, 2))
+        assert torch.allclose(dist.std_param, torch.full((2,), 0.5))
+
+        dist.std.sum().backward()
+        assert torch.allclose(dist.std_param.grad, torch.ones(2))
+
+    def test_log_std_projection_preserves_inward_gradient_at_upper_bound(self) -> None:
+        """An out-of-range log std should be projected without being gradient-locked."""
+        dist = GaussianDistribution(output_dim=2, init_std=1.0, std_type="log", std_range=(0.1, 0.5))
+        with torch.no_grad():
+            dist.log_std_param.fill_(math.log(0.6))
+
+        dist.update(torch.zeros(1, 2))
+        assert torch.allclose(dist.log_std_param, torch.full((2,), math.log(0.5)))
+
+        dist.std.sum().backward()
+        assert torch.allclose(dist.log_std_param.grad, torch.full((2,), 0.5))
+
     def test_std_range_min_floor(self) -> None:
         """The minimum of std_range should be floored to 1e-6 for numerical stability."""
         dist = GaussianDistribution(output_dim=2, init_std=1.0, std_type="scalar", std_range=(0.0, 10.0))

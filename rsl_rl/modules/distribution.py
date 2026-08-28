@@ -184,9 +184,19 @@ class GaussianDistribution(Distribution):
         """Update the Gaussian distribution from MLP output."""
         mean = mlp_output
         if self.std_type == "scalar":
-            std = self.std_param.clamp(self.std_range[0], self.std_range[1])
+            # Project the parameter itself instead of clamping only the value used by
+            # the distribution. A differentiable clamp leaves the raw parameter
+            # outside the valid range and gives it zero gradient there, permanently
+            # pinning a learnable standard deviation at the boundary. Projection
+            # keeps the parameter valid while preserving gradients that can move it
+            # back into the range on a later optimizer step.
+            with torch.no_grad():
+                self.std_param.clamp_(self.std_range[0], self.std_range[1])
+            std = self.std_param
         elif self.std_type == "log":
-            log_std = self.log_std_param.clamp(self.log_std_range[0], self.log_std_range[1])
+            with torch.no_grad():
+                self.log_std_param.clamp_(self.log_std_range[0], self.log_std_range[1])
+            log_std = self.log_std_param
             std = torch.exp(log_std)
         self._distribution = Normal(mean, std)
 
